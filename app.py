@@ -727,22 +727,182 @@ with tab_market:
                 hide_index=True,
             )
 
+
 with tab_analysis:
     st.subheader("Analyse technique")
-
-    st.info(
-        "Le moteur d'analyse sera ajouté dans la partie 2. "
-        "Aucun signal d'achat ou de vente n'est encore généré."
+    st.caption(
+        "Les résultats reposent sur les bougies clôturées "
+        "et les indicateurs calculés. Ils ne garantissent pas "
+        "la direction future du marché."
     )
 
-    if not candles.empty:
-        st.write(f"Marché sélectionné : **{market_name}**")
-        st.write(f"Unité de temps : **{timeframe}**")
-        st.write(
-            f"Dernière bougie (UTC) : "
-            f"**{candles.iloc[-1]['time']}**"
+    if candles.empty:
+        st.warning(
+            "Les données du marché sélectionné sont indisponibles. "
+            "Impossible de produire une analyse fiable."
         )
+    else:
+        # Analyse de l'unité de temps actuellement sélectionnée
+        current_analysis = analyze_timeframe(candles)
 
+        st.markdown("### Synthèse du marché sélectionné")
+        st.write(f"**Marché :** {market_name}")
+        st.write(f"**Unité de temps :** {timeframe}")
+
+        if current_analysis["status"] != "OK":
+            st.warning(current_analysis["status"])
+        else:
+            a, b, c = st.columns(3)
+
+            a.metric(
+                "Biais technique",
+                current_analysis["bias"],
+            )
+
+            b.metric(
+                "RSI (14)",
+                f"{current_analysis['rsi']:.2f}",
+            )
+
+            adx_value = current_analysis["adx"]
+            c.metric(
+                "ADX (14)",
+                f"{adx_value:.2f}"
+                if adx_value is not None
+                else "Indisponible",
+            )
+
+            d, e, f = st.columns(3)
+
+            d.metric(
+                "Dernière clôture analysée",
+                format_price(current_analysis["close"]),
+            )
+
+            e.metric(
+                "MACD",
+                current_analysis["macd"],
+            )
+
+            f.metric(
+                "Structure du marché",
+                current_analysis["structure"],
+            )
+
+            st.write(
+                "**Balayage de liquidité :** "
+                + current_analysis["sweep"]
+            )
+
+            st.write(
+                "**ATR (14) :** "
+                + format_price(current_analysis["atr"])
+            )
+
+            st.divider()
+
+        # Analyse de plusieurs unités de temps
+        st.markdown("### Analyse multi-unités de temps")
+
+        if st.button(
+            "Lancer l'analyse multi-unités",
+            key="run_multi_analysis",
+            use_container_width=True,
+        ):
+            with st.spinner(
+                "Récupération et analyse des différentes unités..."
+            ):
+                multi_results = analyze_multiple_timeframes(
+                    SYMBOLS[market_name],
+                    candle_count,
+                )
+
+            rows = []
+
+            for tf, result in multi_results.items():
+                rows.append({
+                    "Unité": tf,
+                    "État": result.get("status", "Inconnu"),
+                    "Biais": result.get("bias", "Neutre"),
+                    "RSI": (
+                        round(result["rsi"], 2)
+                        if result.get("rsi") is not None
+                        else None
+                    ),
+                    "ADX": (
+                        round(result["adx"], 2)
+                        if result.get("adx") is not None
+                        else None
+                    ),
+                    "MACD": result.get("macd", "Indisponible"),
+                    "Structure": result.get(
+                        "structure", "Indisponible"
+                    ),
+                    "Liquidité": result.get(
+                        "sweep", "Indisponible"
+                    ),
+                })
+
+            result_df = pd.DataFrame(rows)
+
+            st.dataframe(
+                result_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            valid_results = [
+                result
+                for result in multi_results.values()
+                if result.get("status") == "OK"
+            ]
+
+            if valid_results:
+                bullish = sum(
+                    r["bias"] == "Haussier"
+                    for r in valid_results
+                )
+
+                bearish = sum(
+                    r["bias"] == "Baissier"
+                    for r in valid_results
+                )
+
+                neutral = sum(
+                    r["bias"] == "Neutre"
+                    for r in valid_results
+                )
+
+                st.markdown("### Répartition des biais")
+
+                x, y, z = st.columns(3)
+
+                x.metric("Unités haussières", bullish)
+                y.metric("Unités baissières", bearish)
+                z.metric("Unités neutres", neutral)
+
+                if bullish > bearish:
+                    st.info(
+                        "Les biais haussiers sont majoritaires "
+                        "parmi les unités analysées disponibles."
+                    )
+                elif bearish > bullish:
+                    st.info(
+                        "Les biais baissiers sont majoritaires "
+                        "parmi les unités analysées disponibles."
+                    )
+                else:
+                    st.info(
+                        "Les biais haussiers et baissiers sont "
+                        "à égalité parmi les unités analysées."
+                    )
+
+            else:
+                st.warning(
+                    "Aucune unité de temps n'a fourni assez de "
+                    "données valides pour une analyse."
+)
+        
 with tab_history:
     st.subheader("Historique")
 
