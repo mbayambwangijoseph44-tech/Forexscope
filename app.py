@@ -1,538 +1,466 @@
-import streamlit as st
+"""
+deriv_client.py
+Connexion à l'API Deriv (WebSocket) : récupération des bougies historiques
+et des prix en direct, pour toutes les unités de temps utilisées par Forexscope.
+"""
+
+import asyncio
+import json
+import websockets
 import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-import yfinance as yf
-from datetime import datetime, timezone, timedelta
-import os
+from datetime import datetime, timezone
 
-st.set_page_config(page_title="ForexScope Pro v5.2 - Confluence Matrix", page_icon="🎯", layout="wide")
+DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
-# ============================================================
-# JOURNAL PERSISTANT & COOLDOWN DYNAMIQUE
-# ============================================================
-JOURNAL_FILE = "forexscope_journal.csv"
-
-TF_SECONDS = {
-    "M5 (5 min)": 300,
-    "M15 (15 min)": 900,
-    "M30 (30 min)": 1800,
-    "H1 (1 heure)": 3600
+# Correspondance unité de temps Forexscope -> granularité Deriv (en secondes)
+GRANULARITES = {
+    "M1": 60,
+    "M5": 300,
+    "M15": 900,
+    "M30": 1800,
+    "H1": 3600,
+    "H4": 14400,
+    "D1": 86400,
+    "W1": 604800,
+    "MN": 2592000,
 }
 
-def charger_journal():
-    if os.path.exists(JOURNAL_FILE):
+PAIRES_MAJEURES = {
+    "EUR/USD": "frxEURUSD",
+    "GBP/USD": "frxGBPUSD",
+    "USD/JPY": "frxUSDJPY",
+    "USD/CHF": "frxUSDCHF",
+    "AUD/USD": "frxAUDUSD",
+    "USD/CAD": "frxUSDCAD",
+    "NZD/USD": "frxNZDUSD",
+    "XAU/USD": "frxXAUUSD",
+}
+
+
+class DerivClient:
+    """
+    Client simple pour dialoguer avec l'API Deriv.
+    Chaque appel ouvre sa propre connexion WebSocket (plus robuste pour un
+    déploiement Streamlit où le script se relance souvent) plutôt que de
+    garder une connexion persistante partagée entre les reruns.
+    """
+
+    def __init__(self, app_id: int = 1089):
+        self.url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id}"
+
+    async def _request(self, payload: dict, timeout: float = 15.0) -> dict:
+        async with websockets.connect(self.url, open_timeout=timeout) as ws:
+            await ws.send(json.dumps(payload))
+            while True:
+                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                data = json.loads(raw)
+                if data.get("msg_type") in ("candles", "history", "tick", "ticks_history"):
+                    return data
+                if "error" in data:
+                    raise RuntimeError(f"Erreur API Deriv : {data['error'].get('message')}")
+                # On ignore les autres messages (ping/pong, etc.) et on continue d'attendre
+                if "candles" in data or "history" in data or "tick" in data:
+                    return data
+
+    async def get_candles_async(self, symbole: str, granularite_s: int, count: int = 300) -> pd.DataFrame:
+        """
+        Récupère `count` bougies historiques pour un symbole et une granularité donnés.
+        Retourne un DataFrame avec colonnes : epoch, open, high, low, close, time (datetime).
+        """
+        payload = {
+            "ticks_history": symbole,
+            "style": "candles",
+            "granularity": granularite_s,
+            "count": count,
+            "end": "latest",
+        }
+        data = await self._request(payload)
+
+        candles = data.get("candles")
+        if not candles:
+            return pd.DataFrame(columns=["epoch", "open", "high", "low", "close", "time"])
+
+        df = pd.DataFrame(candles)
+        df = df.rename(columns={"epoch": "epoch"})
+        for col in ["open", "high", "low", "close"]:
+            df[col] = df[col].astype(float)
+        df["time"] = pd.to_datetime(df["epoch"], unit="s", utc=True)
+        df = df.sort_values("epoch").reset_index(drop=True)
+        return df[["epoch", "open", "high", "low", "close", "time"]]
+
+    def get_candles(self, symbole: str, granularite_s: int, count: int = 300) -> pd.DataFrame:
+        """Version synchrone (pratique à appeler depuis Streamlit)."""
+        return asyncio.run(self.get_candles_async(symbole, granularite_s, count))
+
+    async def get_last_tick_async(self, symbole: str) -> dict:
+        """Récupère le dernier prix connu (tick) pour un symbole, sans s'abonner en continu."""
+        payload = {"ticks_history": symbole, "style": "ticks", "count": 1, "end": "latest"}
+        data = await self._request(payload)
+        prices = data.get("history", {}).get("prices", [])
+        times = data.get("history", {}).get("times", [])
+        if not prices:
+            return {}
+        return {"price": float(prices[-1]), "epoch": int(times[-1])}
+
+    def get_last_tick(self, symbole: str) -> dict:
+        return asyncio.run(self.get_last_tick_async(symbole))
+
+    def marche_est_ouvert(self, symbole: str) -> bool:
+        """
+        Vérifie si des données récentes sont disponibles pour ce symbole.
+        Si le dernier tick date de plus de 5 minutes, on considère le marché
+        fermé ou les données insuffisantes (ex: weekend Forex).
+        """
         try:
-            df = pd.read_csv(JOURNAL_FILE)
-            return df.to_dict("records")
+            tick = self.get_last_tick(symbole)
+            if not tick:
+                return False
+            age_secondes = datetime.now(timezone.utc).timestamp() - tick["epoch"]
+            return age_secondes < 300
         except Exception:
-            return []
-    return []
-
-def sauvegarder_journal(journal):
-    try:
-        df = pd.DataFrame(journal)
-        df.to_csv(JOURNAL_FILE, index=False)
-    except Exception:
-        pass
-
-if "journal" not in st.session_state:
-    st.session_state.journal = charger_journal()
-
-if "sensibilite" not in st.session_state:
-    st.session_state.sensibilite = "Strict (Haute precision)"
-
-if "signaux_verrouilles" not in st.session_state:
-    st.session_state.signaux_verrouilles = {}
-
-def ajouter_signal(paire, verdict, action, entry, sl, tp, tf, motif, score, confluence_grade, heure_signal):
-    if action not in ["BUY", "SELL"]:
-        return False
-
-    duree_bougie = TF_SECONDS.get(tf, 900)
-    cooldown_requis = duree_bougie * 3
-
-    now = datetime.now(timezone.utc)
-    cle_verrou = paire + "_" + tf
-
-    if cle_verrou in st.session_state.signaux_verrouilles:
-        dernier_temps = st.session_state.signaux_verrouilles[cle_verrou]
-        temps_ecoule = (now - dernier_temps).total_seconds()
-        if temps_ecoule < cooldown_requis:
             return False
+                    """
+indicators.py
+Indicateurs techniques calculés uniquement avec pandas/numpy
+(pas de dépendance externe fragile type ta-lib — important pour un
+déploiement simple sur Streamlit Cloud).
+"""
 
-    for s in st.session_state.journal[:5]:
-        if s.get("Paire") == paire and s.get("Verdict") == verdict and s.get("TF") == tf:
-            return False
+import numpy as np
+import pandas as pd
 
-    st.session_state.journal.insert(0, {
-        "Heure Signal": heure_signal,
-        "Heure Sauvegarde": now.strftime("%Y-%m-%d %H:%M UTC"),
-        "Paire": paire,
-        "TF": tf,
-        "Verdict": verdict,
-        "Confluence": confluence_grade,
-        "Score": str(score) + "%",
-        "Entree": round(entry, 5) if entry else 0,
-        "Stop Loss": round(sl, 5) if sl else 0,
-        "Take Profit": round(tp, 5) if tp else 0,
-        "Motif": motif,
-        "Statut": "Actif"
-    })
 
-    st.session_state.signaux_verrouilles[cle_verrou] = now
-    sauvegarder_journal(st.session_state.journal)
-    return True
+def atr(df: pd.DataFrame, periode: int = 14) -> pd.Series:
+    """Average True Range — sert à la marge de sécurité du Stop Loss."""
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(periode).mean()
 
-# ============================================================
-# NAVIGATION & BARRE LATERALE
-# ============================================================
-st.sidebar.markdown("# 🎯 FOREXSCOPE Pro")
-st.sidebar.caption("Système Décisionnel Multi-Confluence")
-st.sidebar.markdown("---")
 
-page = st.sidebar.radio(
-    "Navigation",
-    ["📊 Tableau de bord", "🔍 Analyse Confluence", "📈 Graphique", "⚠️ Risque", "📓 Journal", "⚙️ Parametres"]
-)
-st.sidebar.markdown("---")
+def rsi(df: pd.DataFrame, periode: int = 14) -> pd.Series:
+    """Relative Strength Index — utilisé pour détecter les divergences."""
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    perte = -delta.clip(upper=0)
+    moy_gain = gain.rolling(periode).mean()
+    moy_perte = perte.rolling(periode).mean()
+    rs = moy_gain / moy_perte.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-st.sidebar.markdown("### 🎛️ Sensibilite")
-sensibilite = st.sidebar.selectbox(
-    "Mode d'analyse",
-    ["Strict (Haute precision)", "Modere (Recommande)", "Dynamique (Plus de signaux)"],
-    key="sensibilite"
-)
 
-heure_utc = datetime.now(timezone.utc)
-heure_actuelle = heure_utc.strftime("%H:%M:%S UTC")
-heure_num = heure_utc.hour
+def macd(df: pd.DataFrame, rapide: int = 12, lent: int = 26, signal: int = 9):
+    """MACD — ligne MACD, ligne de signal, et histogramme."""
+    ema_rapide = df["close"].ewm(span=rapide, adjust=False).mean()
+    ema_lent = df["close"].ewm(span=lent, adjust=False).mean()
+    ligne_macd = ema_rapide - ema_lent
+    ligne_signal = ligne_macd.ewm(span=signal, adjust=False).mean()
+    histogramme = ligne_macd - ligne_signal
+    return ligne_macd, ligne_signal, histogramme
 
-if 7 <= heure_num < 16:
-    session_txt, session_icon = "Londres (Active)", "🟢"
-elif 12 <= heure_num < 20:
-    session_txt, session_icon = "New York (Active)", "🟢"
-else:
-    session_txt, session_icon = "Asie / Nuit (Bloquee)", "🔴"
 
-st.sidebar.markdown("---")
-st.sidebar.caption("🕐 " + heure_actuelle)
-st.sidebar.caption("Session : " + session_icon + " " + session_txt)
-st.sidebar.caption("📓 Journal : " + str(len(st.session_state.journal)) + " signaux")
-st.sidebar.caption("v5.2 - Matrice de Confluence")
+def adx(df: pd.DataFrame, periode: int = 14) -> pd.Series:
+    """
+    Average Directional Index — mesure la force directionnelle du marché.
+    Utilisé par le filtre de régime (Tendance si ADX >= seuil, sinon Range).
+    """
+    high, low, close = df["high"], df["low"], df["close"]
 
-PAIRS = {
-    "AUD/USD": "AUDUSD=X", "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "USDJPY=X", "USD/CAD": "USDCAD=X", "EUR/GBP": "EURGBP=X",
-    "NZD/USD": "NZDUSD=X", "USD/CHF": "USDCHF=X"
-}
+    up_move = high.diff()
+    down_move = -low.diff()
 
-TIMEFRAMES = {
-    "M15 (15 min)": {"interval": "15m", "period": "1mo"},
-    "M5 (5 min)": {"interval": "5m", "period": "5d"},
-    "M30 (30 min)": {"interval": "30m", "period": "1mo"},
-    "H1 (1 heure)": {"interval": "1h", "period": "3mo"}
-}
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-@st.cache_data(ttl=45, show_spinner=False)
-def fetch_data(symbol, period, interval):
-    try:
-        t = yf.Ticker(symbol)
-        df = t.history(period=period, interval=interval, timeout=5)
-        if df is None or df.empty or len(df) < 35:
-            return None
-        df = df[['Open', 'High', 'Low', 'Close']].copy()
-        return df
-    except Exception:
-        return None
-        # ============================================================
-# MOTEUR D'ANALYSE v5.2 (MATRICE DE CONFLUENCE)
-# ============================================================
-def analyze_market(symbol_name, df_ltf, df_htf, mode):
-    if df_ltf is None or len(df_ltf) < 35:
+    tr = pd.concat([
+        (high - low),
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+
+    atr_lisse = tr.rolling(periode).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(periode).mean() / atr_lisse.replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(periode).mean() / atr_lisse.replace(0, np.nan)
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.rolling(periode).mean()
+
+
+def moyenne_mobile(df: pd.DataFrame, periode: int) -> pd.Series:
+    return df["close"].rolling(periode).mean()
+
+
+def detecter_divergence(df: pd.DataFrame, colonne_momentum: pd.Series, fenetre: int = 20) -> str | None:
+    """
+    Détecte une divergence simple entre le prix et un indicateur de momentum
+    (RSI ou MACD) sur les `fenetre` dernières bougies.
+    Retourne "haussiere", "baissiere", ou None.
+    """
+    sous_ensemble = df.tail(fenetre).reset_index(drop=True)
+    momentum = colonne_momentum.tail(fenetre).reset_index(drop=True)
+
+    if len(sous_ensemble) < fenetre or momentum.isna().all():
         return None
 
-    df = df_ltf.copy()
+    idx_prix_max = sous_ensemble["high"].idxmax()
+    idx_prix_min = sous_ensemble["low"].idxmin()
+    idx_mom_max = momentum.idxmax()
+    idx_mom_min = momentum.idxmin()
 
-    # Indicateurs LTF
-    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    # Nouveau plus haut du prix vers la fin de la fenêtre, mais pas du momentum
+    derniers_tiers = int(fenetre * 0.66)
+    if idx_prix_max >= derniers_tiers and idx_mom_max < derniers_tiers:
+        return "baissiere"  # épuisement haussier => divergence baissière
+    if idx_prix_min >= derniers_tiers and idx_mom_min < derniers_tiers:
+        return "haussiere"  # épuisement baissier => divergence haussière
 
-    diff = df['Close'].diff()
-    gain = diff.clip(lower=0).rolling(14).mean()
-    loss = (-diff.clip(upper=0)).rolling(14).mean()
-    rs = gain / (loss + 1e-9)
-    df['RSI'] = 100 - (100 / (1 + rs))
+    return None
+    """
+regime.py
+Détermine si le marché est en RÉGIME DE TENDANCE ou en RÉGIME DE RANGE,
+et calcule le biais de fond (haussier / baissier / neutre).
 
-    tr = np.maximum(
-        df['High'] - df['Low'],
-        np.maximum(abs(df['High'] - df['Close'].shift()), abs(df['Low'] - df['Close'].shift()))
-    )
-    df['ATR'] = tr.rolling(14).mean()
+Règle (cf. prompt validé) :
+ADX >= 23 ET amplitude des 5 dernières bougies > 1.15x la baseline
+des 20 bougies précédentes => TREND, sinon RANGE.
+"""
 
-    plus_dm = df['High'].diff().clip(lower=0)
-    minus_dm = (-df['Low'].diff()).clip(lower=0)
-    plus_dm = plus_dm.where(plus_dm > minus_dm, 0)
-    minus_dm = minus_dm.where(minus_dm > plus_dm, 0)
-    atr14 = df['ATR']
-    plus_di = 100 * (plus_dm.rolling(14).mean() / (atr14 + 1e-9))
-    minus_di = 100 * (minus_dm.rolling(14).mean() / (atr14 + 1e-9))
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    df['ADX'] = dx.rolling(14).mean()
+import pandas as pd
+from indicators import adx, moyenne_mobile
 
-    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = ema12 - ema26
-    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['Hist'] = df['MACD'] - df['Signal']
 
-    # Clôture N-2 (Zéro repeinte)
-    c = df.iloc[-2]
-    prev = df.iloc[-3]
-    atr_val = c['ATR'] if not np.isnan(c['ATR']) else (c['High'] - c['Low'])
-    adx_val = c['ADX'] if not np.isnan(c['ADX']) else 25
-
-    total_range = c['High'] - c['Low']
-    body = abs(c['Close'] - c['Open'])
-    lower_wick = min(c['Close'], c['Open']) - c['Low']
-    upper_wick = c['High'] - max(c['Close'], c['Open'])
-
-    signal_time = str(df.index[-2])
-    now_h = datetime.now(timezone.utc).hour
-    is_session_active = (7 <= now_h < 20)
-
-    # 1. Analyse HTF (H1)
-    htf_trend = "Neutre"
-    if df_htf is not None and len(df_htf) > 50:
-        htf_e20 = df_htf['Close'].ewm(span=20, adjust=False).mean().iloc[-2]
-        htf_e50 = df_htf['Close'].ewm(span=50, adjust=False).mean().iloc[-2]
-        if htf_e20 > htf_e50:
-            htf_trend = "Haussiere"
-        elif htf_e20 < htf_e50:
-            htf_trend = "Baissiere"
-
-    # Pente EMA50
-    if len(df) >= 7:
-        ema50_slope = df['EMA50'].iloc[-2] - df['EMA50'].iloc[-7]
-    else:
-        ema50_slope = 0
-    is_trending_up = ema50_slope > (0.05 * atr_val)
-    is_trending_down = ema50_slope < -(0.05 * atr_val)
-
-    atr_pct = (atr_val / c['Close']) * 100 if c['Close'] > 0 else 0
-    atr_ok = atr_pct > 0.02
-    is_ranging = adx_val < 22
-
-    # Price Action
-    if total_range > 0:
-        is_bull_pinbar = (lower_wick >= 0.6 * total_range) and (body <= 0.3 * total_range)
-        is_bear_pinbar = (upper_wick >= 0.6 * total_range) and (body <= 0.3 * total_range)
-    else:
-        is_bull_pinbar = is_bear_pinbar = False
-
-    is_bull_engulf = (c['Close'] > prev['High']) and (c['Close'] > c['Open'])
-    is_bear_engulf = (c['Close'] < prev['Low']) and (c['Close'] < c['Open'])
-
-    trend_up = c['EMA20'] > c['EMA50'] and c['Close'] > c['EMA50']
-    trend_down = c['EMA20'] < c['EMA50'] and c['Close'] < c['EMA50']
-
-    in_buy_zone = c['Low'] <= c['EMA20'] * 1.001
-    in_sell_zone = c['High'] >= c['EMA20'] * 0.999
-
-    macd_bull = c['Hist'] > prev['Hist']
-    macd_bear = c['Hist'] < prev['Hist']
-
-    # ============================================================
-    # EVALUATION DES 5 PILIERS DE CONFLUENCE
-    # ============================================================
-    piliers_buy = {
-        "1. Tendance H1": htf_trend == "Haussiere",
-        "2. Structure LTF": trend_up and is_trending_up,
-        "3. Zone Retest EMA": in_buy_zone,
-        "4. Price Action": is_bull_pinbar or is_bull_engulf,
-        "5. Momentum (RSI/MACD)": (40 <= c['RSI'] <= 65) and macd_bull
+def calculer_regime(df: pd.DataFrame, seuil_adx: float = 23.0, ratio_amplitude: float = 1.15) -> dict:
+    """
+    Retourne un dict :
+    {
+        "regime": "TREND" | "RANGE",
+        "adx": valeur actuelle,
+        "biais": "haussier" | "baissier" | "neutre",
     }
+    """
+    if len(df) < 30:
+        return {"regime": "RANGE", "adx": None, "biais": "neutre"}
 
-    piliers_sell = {
-        "1. Tendance H1": htf_trend == "Baissiere",
-        "2. Structure LTF": trend_down and is_trending_down,
-        "3. Zone Retest EMA": in_sell_zone,
-        "4. Price Action": is_bear_pinbar or is_bear_engulf,
-        "5. Momentum (RSI/MACD)": (35 <= c['RSI'] <= 60) and macd_bear
-    }
+    adx_series = adx(df)
+    adx_actuel = adx_series.iloc[-1]
 
-    conf_buy_score = sum(piliers_buy.values())
-    conf_sell_score = sum(piliers_sell.values())
+    amplitude = (df["high"] - df["low"])
+    amplitude_recente = amplitude.tail(5).mean()
+    baseline = amplitude.iloc[-25:-5].mean()
 
-    # Calcul du score pondéré %
-    score_buy = (conf_buy_score / 5.0) * 100
-    score_sell = (conf_sell_score / 5.0) * 100
+    est_tendance = False
+    if pd.notna(adx_actuel) and pd.notna(baseline) and baseline > 0:
+        est_tendance = (adx_actuel >= seuil_adx) and (amplitude_recente > ratio_amplitude * baseline)
 
-    # Gestion des pips (JPY vs Standards)
-    is_jpy = "JPY" in symbol_name
-    pip_multiplier = 100.0 if is_jpy else 10000.0
-    min_sl_dist = 0.180 if is_jpy else 0.00180  # 18 pips plancher
+    mm20 = moyenne_mobile(df, 20).iloc[-1]
+    mm50 = moyenne_mobile(df, 50).iloc[-1] if len(df) >= 50 else None
+    prix_actuel = df["close"].iloc[-1]
 
-    entry = sl = tp = None
-    risk = 0
-
-    if trend_up:
-        entry = df.iloc[-1]['Open']
-        recent_low = df['Low'].iloc[-7:-2].min()
-        sl = round(min(recent_low, entry - (1.5 * atr_val)), 5 if not is_jpy else 3)
-        risk = entry - sl
-        if risk < min_sl_dist:
-            sl = round(entry - min_sl_dist, 5 if not is_jpy else 3)
-            risk = min_sl_dist
-        tp = round(entry + (2.0 * risk), 5 if not is_jpy else 3)
-
-    elif trend_down:
-        entry = df.iloc[-1]['Open']
-        recent_high = df['High'].iloc[-7:-2].max()
-        sl = round(max(recent_high, entry + (1.5 * atr_val)), 5 if not is_jpy else 3)
-        risk = sl - entry
-        if risk < min_sl_dist:
-            sl = round(entry + min_sl_dist, 5 if not is_jpy else 3)
-            risk = min_sl_dist
-        tp = round(entry - (2.0 * risk), 5 if not is_jpy else 3)
-
-    # Seuils de validation selon la sensibilité
-    if "Strict" in mode:
-        min_confluence = 4  # Uniquement Setup A ou A+ (4/5 ou 5/5)
-    elif "Modere" in mode:
-        min_confluence = 3  # Setups 3/5 acceptés
-    else:
-        min_confluence = 2
-
-    verdict = "ATTENDRE"
-    color = "#FFA500"
-    action = "HOLD"
-    final_conf = max(conf_buy_score, conf_sell_score)
-    final_score = int(max(score_buy, score_sell))
-    piliers_actifs = piliers_buy if conf_buy_score >= conf_sell_score else piliers_sell
-
-    # Détermination du grade
-    if final_conf == 5:
-        grade = "⭐⭐⭐⭐⭐ A+ (5/5)"
-    elif final_conf == 4:
-        grade = "⭐⭐⭐⭐ A (4/5)"
-    elif final_conf == 3:
-        grade = "⭐⭐⭐ B (3/5)"
-    else:
-        grade = "⚪ C (" + str(final_conf) + "/5)"
-
-    # Raisonnement décisionnel
-    if not is_session_active:
-        motif_final = "KILL-ZONE : Session Asie/Nuit. Trades bloqués."
-    elif not atr_ok:
-        motif_final = "Volatilité trop faible (ATR). Marché endormi."
-    elif is_ranging:
-        motif_final = "Marché en range (ADX < 22). Pas de direction."
-    elif not is_trending_up and not is_trending_down:
-        motif_final = "EMA50 plate : marché plat. Attendre impulsion."
-    elif conf_buy_score >= min_confluence and conf_buy_score > conf_sell_score and htf_trend != "Baissiere":
-        verdict = "ACHAT (" + str(final_score) + "%)"
-        color = "#00FF88"
-        action = "BUY"
-        motif_final = "Setup " + grade + " validé avec " + str(conf_buy_score) + "/5 confluences."
-    elif conf_sell_score >= min_confluence and conf_sell_score > conf_buy_score and htf_trend != "Haussiere":
-        verdict = "VENTE (" + str(final_score) + "%)"
-        color = "#FF3366"
-        action = "SELL"
-        motif_final = "Setup " + grade + " validé avec " + str(conf_sell_score) + "/5 confluences."
-    else:
-        motif_final = "Confluence insuffisante (" + str(final_conf) + "/5). " + str(min_confluence) + "/5 requis en mode " + mode.split()[0] + "."
+    biais = "neutre"
+    if mm50 is not None and pd.notna(mm20) and pd.notna(mm50):
+        if prix_actuel > mm20 > mm50:
+            biais = "haussier"
+        elif prix_actuel < mm20 < mm50:
+            biais = "baissier"
 
     return {
-        "verdict": verdict, "color": color, "action": action, "motif": motif_final,
-        "entry": entry, "sl": sl, "tp": tp, "score": final_score,
-        "confluence_score": final_conf, "confluence_grade": grade, "piliers": piliers_actifs,
-        "rsi": round(c['RSI'], 1), "atr": round(atr_val, 5), "adx": round(adx_val, 1),
-        "htf_trend": htf_trend, "trend": "Haussiere" if trend_up else ("Baissiere" if trend_down else "Range"),
-        "price": df.iloc[-1]['Close'], "signal_time": signal_time,
-        "risk_pips": round(risk * pip_multiplier, 1) if entry and sl else 0
+        "regime": "TREND" if est_tendance else "RANGE",
+        "adx": round(float(adx_actuel), 1) if pd.notna(adx_actuel) else None,
+        "biais": biais,
     }
-    # ============================================================
-# PAGE 1 : TABLEAU DE BORD (SCANNER DE CONFLUENCE)
-# ============================================================
-if page == "📊 Tableau de bord":
-    st.markdown("# 📊 Tableau de Bord Multi-Paires")
-    st.markdown("---")
+    """
+structure_engine.py
+Détection de la structure de marché : swings (HH/HL/LH/LL), cassures de
+structure (BOS / CHOCH-MSS), prises de liquidité (sweeps), Order Blocks
+et Fair Value Gaps.
 
-    c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-    with c1:
-        try:
-            test = yf.Ticker("AUDUSD=X")
-            h = test.history(period="1d", interval="1h", timeout=4)
-            if not h.empty:
-                st.success("🟢 Yahoo Finance : Connecté")
-            else:
-                st.error("🔴 Yahoo Finance : Pas de données")
-        except Exception:
-            st.error("🔴 Yahoo Finance : Erreur")
-    with c2:
-        st.info("🕐 " + heure_actuelle)
-    with c3:
-        if session_icon == "🟢":
-            st.success("Session : " + session_txt)
-        else:
-            st.warning("Session : " + session_txt)
-    with c4:
-        if st.button("🔄", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+Toute la détection se fait sur les bougies DÉJÀ CLÔTURÉES (df.iloc[:-1] si la
+dernière bougie du flux est encore en formation) — voir commentaire dans
+decision_engine.py sur ce point, essentiel pour éviter le bruit du score live.
+"""
 
-    st.markdown("---")
-    st.markdown("### Scanner des Paires & Confluence")
-    tf_scan = st.selectbox("Unité de temps LTF", list(TIMEFRAMES.keys()), index=0)
-    tf_cfg = TIMEFRAMES[tf_scan]
+import pandas as pd
+from dataclasses import dataclass, field
 
-    if st.button("🚀 Scanner le Marché", use_container_width=True, type="primary"):
-        results = []
-        bar = st.progress(0)
-        for i, (name, sym) in enumerate(PAIRS.items()):
-            df_ltf = fetch_data(sym, tf_cfg["period"], tf_cfg["interval"])
-            df_htf = fetch_data(sym, "3mo", "1h")
-            res = analyze_market(name, df_ltf, df_htf, sensibilite)
-            if res:
-                if res["action"] in ["BUY", "SELL"]:
-                    ajouter_signal(
-                        name, res["verdict"], res["action"],
-                        res["entry"], res["sl"], res["tp"],
-                        tf_scan, res["motif"], res["score"],
-                        res["confluence_grade"], res["signal_time"]
-                    )
-                results.append({
-                    "Paire": name, "Verdict": res["verdict"], "Confluence": res["confluence_grade"],
-                    "H1": res["htf_trend"], "RSI": res["rsi"], "ADX": res["adx"],
-                    "SL (pips)": res["risk_pips"], "Signal à": res["signal_time"], "Analyse": res["motif"]
-                })
-            bar.progress((i + 1) / len(PAIRS))
 
-        if results:
-            for r in results:
-                if "ACHAT" in r["Verdict"]:
-                    st.success("🟢 **" + r["Paire"] + "** | " + r["Verdict"] + " | " + r["Confluence"] + " | SL: " + str(r["SL (pips)"]) + " pips | " + r["Analyse"])
-                elif "VENTE" in r["Verdict"]:
-                    st.error("🔴 **" + r["Paire"] + "** | " + r["Verdict"] + " | " + r["Confluence"] + " | SL: " + str(r["SL (pips)"]) + " pips | " + r["Analyse"])
-                else:
-                    st.warning("🟡 **" + r["Paire"] + "** | " + r["Verdict"] + " | " + r["Confluence"] + " | " + r["Analyse"])
-            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+@dataclass
+class Swing:
+    index: int
+    prix: float
+    type: str  # "high" ou "low"
 
-# ============================================================
-# PAGE 2 : ANALYSE & CHECKLIST DES 5 PILIERS
-# ============================================================
-elif page == "🔍 Analyse Confluence":
-    st.markdown("# 🔍 Analyse Détaillée & Confluence")
-    st.markdown("---")
 
-    col1, col2 = st.columns(2)
-    p_name = col1.selectbox("Paire", list(PAIRS.keys()), index=0)
-    tf_name = col2.selectbox("Unité de temps", list(TIMEFRAMES.keys()), index=0)
+@dataclass
+class Structure:
+    swings: list = field(default_factory=list)
+    sequence: str = ""          # ex: "HH-HL-HH" ou "LH-LL-LH"
+    dernier_evenement: str | None = None   # "BOS" ou "CHOCH"
+    direction: str | None = None           # "haussiere" ou "baissiere"
+    niveau_invalidation: float | None = None   # swing utilisé comme invalidation
 
-    tf_cfg = TIMEFRAMES[tf_name]
-    df_ltf = fetch_data(PAIRS[p_name], tf_cfg["period"], tf_cfg["interval"])
-    df_htf = fetch_data(PAIRS[p_name], "3mo", "1h")
-    res = analyze_market(p_name, df_ltf, df_htf, sensibilite)
 
-    if res:
-        st.markdown(
-            "<div style='background-color: #1E222D; border-left: 8px solid " + res["color"] + "; padding: 20px; border-radius: 8px; margin-bottom: 15px;'>"
-            + "<h1 style='color: " + res["color"] + "; margin: 0;'>" + res["verdict"] + "</h1>"
-            + "<h3 style='color: #EEE; margin: 5px 0 0 0;'>Grade : " + res["confluence_grade"] + "</h3>"
-            + "<p style='color: #CCC; margin: 8px 0 0 0;'><b>" + p_name + "</b> | " + tf_name + " | Prix : <b>" + str(round(res["price"], 5)) + "</b> | Tendance H1 : <b>" + res["htf_trend"] + "</b></p>"
-            + "<p style='color: #AAA; margin: 5px 0 0 0;'><b>Observation :</b> " + res["motif"] + "</p>"
-            + "<p style='color: #666; font-size: 12px; margin: 5px 0 0 0;'>Bougie clôturée à : " + res["signal_time"] + "</p></div>",
-            unsafe_allow_html=True
-        )
+def detecter_swings(df: pd.DataFrame, lookback: int = 3) -> list[Swing]:
+    """
+    Détecte les pivots (swing highs / swing lows) par méthode fractale :
+    un sommet est un `high` supérieur aux `lookback` bougies de chaque côté.
+    """
+    swings = []
+    highs, lows = df["high"].values, df["low"].values
+    n = len(df)
 
-        st.markdown("### 🧩 Matrice des 5 Piliers de Confluence")
-        p_cols = st.columns(5)
-        for idx, (nom_pilier, etat) in enumerate(res["piliers"].items()):
-            with p_cols[idx]:
-                if etat:
-                    st.success("🟢 " + nom_pilier + "\n\n**Validé**")
-                else:
-                    st.error("🔴 " + nom_pilier + "\n\n**Non aligné**")
+    for i in range(lookback, n - lookback):
+        fenetre_high = highs[i - lookback:i + lookback + 1]
+        fenetre_low = lows[i - lookback:i + lookback + 1]
 
-        st.markdown("---")
-        if res["action"] in ["BUY", "SELL"]:
-            st.markdown("### 📋 Ordre d'Exécution MT5")
-            x1, x2, x3, x4 = st.columns(4)
-            x1.metric("Prix Entrée", str(round(res["entry"], 5)))
-            x2.metric("Stop Loss (" + str(res["risk_pips"]) + " pips)", str(round(res["sl"], 5)))
-            x3.metric("Take Profit", str(round(res["tp"], 5)))
-            x4.metric("Ratio R:R", "1 : 2.0")
+        if highs[i] == fenetre_high.max() and highs[i] > fenetre_high[:lookback].max():
+            swings.append(Swing(index=i, prix=highs[i], type="high"))
+        if lows[i] == fenetre_low.min() and lows[i] < fenetre_low[:lookback].min():
+            swings.append(Swing(index=i, prix=lows[i], type="low"))
 
-            if st.button("📝 Sauvegarder dans le Journal", use_container_width=True, type="primary"):
-                ok = ajouter_signal(
-                    p_name, res["verdict"], res["action"],
-                    res["entry"], res["sl"], res["tp"],
-                    tf_name, res["motif"], res["score"],
-                    res["confluence_grade"], res["signal_time"]
-                )
-                if ok:
-                    st.success("Signal enregistré dans le journal permanent avec verrouillage 3 bougies !")
-                else:
-                    st.warning("Signal déjà présent ou verrouillage actif pour cette unité de temps.")
-        else:
-            st.info("💡 Attendez que 4 ou 5 confluences soient alignées avant d'entrer sur le marché.")
+    swings.sort(key=lambda s: s.index)
+    return swings
 
-# ============================================================
-# PAGES SECONDAIRES
-# ============================================================
-elif page == "📈 Graphique":
-    st.markdown("# 📈 Graphique des Prix")
-    p_name = st.selectbox("Paire", list(PAIRS.keys()))
-    tf_name = st.selectbox("Unité de temps", list(TIMEFRAMES.keys()))
-    df = fetch_data(PAIRS[p_name], TIMEFRAMES[tf_name]["period"], TIMEFRAMES[tf_name]["interval"])
-    if df is not None:
-        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Prix"))
-        fig.add_trace(go.Scatter(x=df.index, y=df['EMA20'], line=dict(color='#00E5FF', width=1.5), name="EMA 20"))
-        fig.add_trace(go.Scatter(x=df.index, y=df['EMA50'], line=dict(color='#FF9100', width=1.5), name="EMA 50"))
-        fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=550)
-        st.plotly_chart(fig, use_container_width=True)
 
-elif page == "⚠️ Risque":
-    st.markdown("# ⚠️ Calculateur de Position MT5")
-    cap = st.number_input("Capital du Compte ($)", value=1000.0, step=100.0)
-    risk_pct = st.number_input("Risque par Trade (%)", value=1.0, step=0.5)
-    sl_pips = st.number_input("Stop Loss (pips)", value=20.0, step=1.0)
-    
-    montant_risque = cap * (risk_pct / 100.0)
-    lot_calcule = round(montant_risque / (sl_pips * 10.0), 2)
-    
-    c1, c2 = st.columns(2)
-    c1.metric("Montant Risqué", "$" + str(round(montant_risque, 2)))
-    c2.metric("Taille de Lot MT5", str(lot_calcule) + " Lot(s)")
+def analyser_structure(df: pd.DataFrame, lookback: int = 3) -> Structure:
+    """
+    Construit la séquence HH/HL/LH/LL à partir des swings détectés, et
+    identifie le dernier événement structurel (BOS = continuation,
+    CHOCH/MSS = changement de caractère).
+    """
+    swings = detecter_swings(df, lookback)
+    if len(swings) < 4:
+        return Structure(swings=swings)
 
-elif page == "📓 Journal":
-    st.markdown("# 📓 Journal de Trading Persistant")
-    st.session_state.journal = charger_journal()
-    if len(st.session_state.journal) == 0:
-        st.info("Aucun signal enregistré.")
+    highs = [s for s in swings if s.type == "high"]
+    lows = [s for s in swings if s.type == "low"]
+
+    etiquettes = []
+    for i in range(1, len(highs)):
+        etiquettes.append(("HH", highs[i]) if highs[i].prix > highs[i - 1].prix else ("LH", highs[i]))
+    for i in range(1, len(lows)):
+        etiquettes.append(("HL", lows[i]) if lows[i].prix > lows[i - 1].prix else ("LL", lows[i]))
+
+    etiquettes.sort(key=lambda t: t[1].index)
+    sequence = "-".join(e[0] for e in etiquettes[-5:])
+
+    prix_actuel = df["close"].iloc[-1]
+    dernier_swing_high = highs[-1] if highs else None
+    dernier_swing_low = lows[-1] if lows else None
+
+    dernier_evenement, direction, niveau_invalidation = None, None, None
+
+    tendance_haussiere = len([e for e in etiquettes[-4:] if e[0] in ("HH", "HL")]) >= 2
+    tendance_baissiere = len([e for e in etiquettes[-4:] if e[0] in ("LH", "LL")]) >= 2
+
+    if dernier_swing_high and prix_actuel > dernier_swing_high.prix:
+        if tendance_haussiere:
+            dernier_evenement, direction = "BOS", "haussiere"
+        elif tendance_baissiere:
+            dernier_evenement, direction = "CHOCH", "haussiere"
+        niveau_invalidation = dernier_swing_low.prix if dernier_swing_low else None
+
+    elif dernier_swing_low and prix_actuel < dernier_swing_low.prix:
+        if tendance_baissiere:
+            dernier_evenement, direction = "BOS", "baissiere"
+        elif tendance_haussiere:
+            dernier_evenement, direction = "CHOCH", "baissiere"
+        niveau_invalidation = dernier_swing_high.prix if dernier_swing_high else None
+
+    return Structure(
+        swings=swings,
+        sequence=sequence,
+        dernier_evenement=dernier_evenement,
+        direction=direction,
+        niveau_invalidation=niveau_invalidation,
+    )
+
+
+def detecter_sweep(df: pd.DataFrame, swings: list[Swing], tolerance_pips: float = 0.0) -> dict | None:
+    """
+    Un sweep (prise de liquidité) = une bougie dont la mèche dépasse un
+    ancien swing high/low, mais dont la clôture revient À L'INTÉRIEUR —
+    contrairement à une vraie cassure (BOS/CHOCH) où la clôture va au-delà.
+    """
+    if len(df) < 2 or not swings:
+        return None
+
+    derniere = df.iloc[-1]
+    swings_highs = [s for s in swings if s.type == "high"]
+    swings_lows = [s for s in swings if s.type == "low"]
+
+    if swings_highs:
+        dernier_high = swings_highs[-1]
+        if derniere["high"] > dernier_high.prix + tolerance_pips and derniere["close"] < dernier_high.prix:
+            return {"type": "SSL_SWEEP", "niveau": dernier_high.prix, "direction": "baissiere"}
+
+    if swings_lows:
+        dernier_low = swings_lows[-1]
+        if derniere["low"] < dernier_low.prix - tolerance_pips and derniere["close"] > dernier_low.prix:
+            return {"type": "BSL_SWEEP", "niveau": dernier_low.prix, "direction": "haussiere"}
+
+    return None
+
+
+def detecter_fvg(df: pd.DataFrame, nb_bougies_recentes: int = 15) -> list[dict]:
+    """
+    Fair Value Gap (déséquilibre 3 bougies) :
+    - FVG haussier  : high(bougie[i-2]) < low(bougie[i])
+    - FVG baissier  : low(bougie[i-2])  > high(bougie[i])
+    Retourne la liste des FVG détectés sur les N dernières bougies, avec leur
+    fraîcheur (nombre de bougies depuis leur formation) et s'ils ont déjà été
+    comblés (mitigés) par le prix depuis.
+    """
+    fvgs = []
+    sous_df = df.tail(nb_bougies_recentes + 2).reset_index(drop=True)
+
+    for i in range(2, len(sous_df)):
+        b0, b2 = sous_df.iloc[i - 2], sous_df.iloc[i]
+        if b2["low"] > b0["high"]:
+            zone = (b0["high"], b2["low"])
+            mitige = (sous_df["low"].iloc[i + 1:] <= zone[1]).any() if i + 1 < len(sous_df) else False
+            fvgs.append({"type": "haussier", "zone": zone, "fraicheur": len(sous_df) - 1 - i, "mitige": bool(mitige)})
+        elif b2["high"] < b0["low"]:
+            zone = (b2["high"], b0["low"])
+            mitige = (sous_df["high"].iloc[i + 1:] >= zone[0]).any() if i + 1 < len(sous_df) else False
+            fvgs.append({"type": "baissier", "zone": zone, "fraicheur": len(sous_df) - 1 - i, "mitige": bool(mitige)})
+
+    return fvgs
+
+
+def detecter_order_block(df: pd.DataFrame, structure: Structure) -> dict | None:
+    """
+    Order Block simplifié : la dernière bougie opposée au mouvement avant
+    un BOS/CHOCH impulsif.
+    - BOS/CHOCH haussier -> dernière bougie baissière avant la cassure = OB haussier
+    - BOS/CHOCH baissier -> dernière bougie haussière avant la cassure = OB baissier
+    """
+    if not structure.dernier_evenement or len(df) < 5:
+        return None
+
+    recent = df.tail(10).reset_index(drop=True)
+
+    if structure.direction == "haussiere":
+        bougies_baissieres = recent[recent["close"] < recent["open"]]
+        if bougies_baissieres.empty:
+            return None
+        derniere_baissiere = bougies_baissieres.iloc[-1]
+        return {
+            "type": "haussier",
+            "zone": (derniere_baissiere["low"], derniere_baissiere["open"]),
+            "mitige": False,
+        }
     else:
-        df_j = pd.DataFrame(st.session_state.journal)
-        st.dataframe(df_j, use_container_width=True, hide_index=True)
-        c_dl, c_clr = st.columns(2)
-        with c_dl:
-            st.download_button("📥 Télécharger CSV", df_j.to_csv(index=False).encode('utf-8'), "forexscope_journal.csv", "text/csv", use_container_width=True)
-        with c_clr:
-            if st.button("🗑️ Effacer le journal", use_container_width=True):
-                st.session_state.journal = []
-                sauvegarder_journal([])
-                st.rerun()
-
-elif page == "⚙️ Parametres":
-    st.markdown("# ⚙️ Paramètres & Fonctionnement")
-    st.markdown("""
-    ### 🛡️ Règles de Sécurité Actives :
-    - **Score de Confluence (5 Piliers) :** Exige l'accord entre Tendance H1, Structure M15, Retest EMA, Price Action et Momentum.
-    - **Grade A+ (5/5) & A (4/5) :** Priorise uniquement les configurations à très fort avantage statistique.
-    - **Stop Loss Structurel avec Plancher 18 Pips :** Protège contre les mèches de spread.
-    - **Verrouillage Dynamique 3 Bougies :** Empêche les faux signaux successifs sur la même paire.
-    - **Calcul Strict sur Bougie Clôturée N-2 :** Zéro repeinte.
-    """)
+        bougies_haussieres = recent[recent["close"] > recent["open"]]
+        if bougies_haussieres.empty:
+            return None
+        derniere_haussiere = bougies_haussieres.iloc[-1]
+        return {
+            "type": "baissier",
+            "zone": (derniere_haussiere["open"], derniere_haussiere["high"]),
+            "mitige": False,
+    }
+    
