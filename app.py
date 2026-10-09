@@ -198,6 +198,349 @@ def fetch_candles(symbol, timeframe, count=300):
 
 
 # =========================================================
+# 5B. INDICATEURS TECHNIQUES
+# =========================================================
+
+def calculate_indicators(data):
+    """Calcule les indicateurs utilisés par ForexScope."""
+
+    if data is None or data.empty:
+        return pd.DataFrame()
+
+    df = data.copy()
+
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+
+    # Moyennes mobiles exponentielles
+    df["ema_20"] = close.ewm(span=20, adjust=False).mean()
+    df["ema_50"] = close.ewm(span=50, adjust=False).mean()
+    df["ema_200"] = close.ewm(span=200, adjust=False).mean()
+
+    # RSI sur 14 périodes
+    delta = close.diff()
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+
+    avg_gain = gains.ewm(
+        alpha=1 / 14, min_periods=14, adjust=False
+    ).mean()
+
+    avg_loss = losses.ewm(
+        alpha=1 / 14, min_periods=14, adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    # Gestion des séries où le prix ne baisse jamais
+    df.loc[avg_loss == 0, "rsi"] = 100
+
+    # ATR sur 14 périodes
+    previous_close = close.shift(1)
+
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    df["atr"] = true_range.ewm(
+        alpha=1 / 14, min_periods=14, adjust=False
+    ).mean()
+
+    # MACD
+    ema_12 = close.ewm(span=12, adjust=False).mean()
+    ema_26 = close.ewm(span=26, adjust=False).mean()
+
+    df["macd"] = ema_12 - ema_26
+    df["macd_signal"] = df["macd"].ewm(
+        span=9, adjust=False
+    ).mean()
+
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+
+    # ADX : mesure la force de la tendance
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = pd.Series(
+        np.where(
+            (up_move > down_move) & (up_move > 0),
+            up_move,
+            0.0,
+        ),
+        index=df.index,
+    )
+
+    minus_dm = pd.Series(
+        np.where(
+            (down_move > up_move) & (down_move > 0),
+            down_move,
+            0.0,
+        ),
+        index=df.index,
+    )
+
+    atr_safe = df["atr"].replace(0, np.nan)
+
+    plus_di = (
+        100
+        * plus_dm.ewm(
+            alpha=1 / 14, min_periods=14, adjust=False
+        ).mean()
+        / atr_safe
+    )
+
+    minus_di = (
+        100
+        * minus_dm.ewm(
+            alpha=1 / 14, min_periods=14, adjust=False
+        ).mean()
+        / atr_safe
+    )
+
+    di_sum = (plus_di + minus_di).replace(0, np.nan)
+
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+
+    df["plus_di"] = plus_di
+    df["minus_di"] = minus_di
+    df["adx"] = dx.ewm(
+        alpha=1 / 14, min_periods=14, adjust=False
+    ).mean()
+
+    return df
+
+
+# =========================================================
+# 5C. STRUCTURE DU MARCHÉ
+# =========================================================
+
+def analyze_market_structure(data, lookback=30):
+    """Évalue la structure récente avec les sommets et creux."""
+
+    if data is None or len(data) < 10:
+        return {
+            "structure": "Données insuffisantes",
+            "last_high": None,
+            "last_low": None,
+        }
+
+    recent = data.tail(lookback).copy()
+
+    last_high = float(recent["high"].max())
+    last_low = float(recent["low"].min())
+    last_close = float(recent["close"].iloc[-1])
+
+    midpoint = (last_high + last_low) / 2
+
+    if last_close > midpoint:
+        structure = "Biais haussier"
+    elif last_close < midpoint:
+        structure = "Biais baissier"
+    else:
+        structure = "Neutre"
+
+    return {
+        "structure": structure,
+        "last_high": last_high,
+        "last_low": last_low,
+    }
+
+
+# =========================================================
+# 5D. BALAYAGE DE LIQUIDITÉ
+# =========================================================
+
+def detect_liquidity_sweep(data, lookback=20):
+    """
+    Détecte une possible prise de liquidité :
+    - Sweep haussier : le prix passe sous un ancien creux,
+      puis clôture au-dessus de ce creux.
+    - Sweep baissier : le prix dépasse un ancien sommet,
+      puis clôture sous ce sommet.
+    """
+
+    result = {
+        "sweep": "Aucun balayage détecté",
+        "level": None,
+    }
+
+    if data is None or len(data) < lookback + 2:
+        return result
+
+    # On compare la dernière bougie aux bougies précédentes.
+    previous = data.iloc[-(lookback + 1):-1]
+    last = data.iloc[-1]
+
+    previous_low = float(previous["low"].min())
+    previous_high = float(previous["high"].max())
+
+    if (
+        float(last["low"]) < previous_low
+        and float(last["close"]) > previous_low
+    ):
+        result["sweep"] = "Sweep haussier potentiel"
+        result["level"] = previous_low
+
+    elif (
+        float(last["high"]) > previous_high
+        and float(last["close"]) < previous_high
+    ):
+        result["sweep"] = "Sweep baissier potentiel"
+        result["level"] = previous_high
+
+    return result
+
+
+# =========================================================
+# 5E. ANALYSE D'UNE UNITÉ DE TEMPS
+# =========================================================
+
+def analyze_timeframe(raw_data):
+    """Produit une synthèse technique pour une unité de temps."""
+
+    if raw_data is None or len(raw_data) < 50:
+        return {
+            "status": "Données insuffisantes",
+            "bias": "Neutre",
+            "rsi": None,
+            "adx": None,
+            "atr": None,
+            "macd": "Indisponible",
+            "structure": "Indisponible",
+            "sweep": "Indisponible",
+            "close": None,
+        }
+
+    df = calculate_indicators(raw_data)
+    df = df.dropna(subset=["ema_20", "ema_50", "rsi", "atr"])
+
+    if df.empty:
+        return {
+            "status": "Indicateurs indisponibles",
+            "bias": "Neutre",
+            "rsi": None,
+            "adx": None,
+            "atr": None,
+            "macd": "Indisponible",
+            "structure": "Indisponible",
+            "sweep": "Indisponible",
+            "close": None,
+        }
+
+    # La dernière bougie peut encore être en formation.
+    # On privilégie la dernière bougie clôturée.
+    if len(df) >= 2:
+        closed = df.iloc[:-1].copy()
+    else:
+        closed = df.copy()
+
+    last = closed.iloc[-1]
+
+    bullish_points = 0
+    bearish_points = 0
+
+    if last["close"] > last["ema_20"]:
+        bullish_points += 1
+    elif last["close"] < last["ema_20"]:
+        bearish_points += 1
+
+    if last["ema_20"] > last["ema_50"]:
+        bullish_points += 1
+    elif last["ema_20"] < last["ema_50"]:
+        bearish_points += 1
+
+    if last["macd"] > last["macd_signal"]:
+        bullish_points += 1
+    elif last["macd"] < last["macd_signal"]:
+        bearish_points += 1
+
+    if last["rsi"] > 55:
+        bullish_points += 1
+    elif last["rsi"] < 45:
+        bearish_points += 1
+
+    if bullish_points > bearish_points:
+        bias = "Haussier"
+    elif bearish_points > bullish_points:
+        bias = "Baissier"
+    else:
+        bias = "Neutre"
+
+    structure = analyze_market_structure(closed)
+    sweep = detect_liquidity_sweep(closed)
+
+    if last["macd"] > last["macd_signal"]:
+        macd_state = "Haussier"
+    elif last["macd"] < last["macd_signal"]:
+        macd_state = "Baissier"
+    else:
+        macd_state = "Neutre"
+
+    return {
+        "status": "OK",
+        "bias": bias,
+        "rsi": float(last["rsi"]),
+        "adx": (
+            float(last["adx"])
+            if pd.notna(last["adx"])
+            else None
+        ),
+        "atr": float(last["atr"]),
+        "macd": macd_state,
+        "structure": structure["structure"],
+        "sweep": sweep["sweep"],
+        "close": float(last["close"]),
+        "ema_20": float(last["ema_20"]),
+        "ema_50": float(last["ema_50"]),
+        "ema_200": (
+            float(last["ema_200"])
+            if pd.notna(last["ema_200"])
+            else None
+        ),
+        "bullish_points": bullish_points,
+        "bearish_points": bearish_points,
+        "candle_time": last["time"],
+    }
+
+
+# =========================================================
+# 5F. ANALYSE MULTI-UNITÉS DE TEMPS
+# =========================================================
+
+def analyze_multiple_timeframes(symbol, count=300):
+    """Récupère et analyse les différentes unités de temps."""
+
+    results = {}
+
+    for tf in ["M5", "M15", "M30", "H1", "H4", "D1"]:
+        raw_data = fetch_candles(symbol, tf, count)
+
+        if raw_data.empty:
+            results[tf] = {
+                "status": "Données indisponibles",
+                "bias": "Neutre",
+                "rsi": None,
+                "adx": None,
+                "atr": None,
+                "macd": "Indisponible",
+                "structure": "Indisponible",
+                "sweep": "Indisponible",
+                "close": None,
+            }
+            continue
+
+        results[tf] = analyze_timeframe(raw_data)
+
+    return results
+    
+# =========================================================
 # 6. FONCTIONS D'AFFICHAGE
 # =========================================================
 
