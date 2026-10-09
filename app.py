@@ -1119,35 +1119,28 @@ with tab_analysis:
                 st.error("Biais baissier détecté. Vérifie le contexte avant toute entrée.")
             else:
                 st.warning("Pas de confluence suffisante : aucune entrée proposée.")
+            if signal_result["signal"] in ("ACHAT", "VENTE"):
+                p1, p2, p3 = st.columns(3)
 
-            p1, p2, p3 = st.columns(3)
+                p1.metric(
+                    "Entrée indicative",
+                    format_price(signal_result["entry"]),
+                )
 
-            p1.metric(
-                "Entrée indicative",
-                (
-                    format_price(signal_result["entry"])
-                    if signal_result["entry"] is not None
-                    else "—"
-                ),
-            )
+                p2.metric(
+                    "Stop Loss",
+                    format_price(signal_result["stop_loss"]),
+                )
 
-            p2.metric(
-                "Stop Loss",
-                (
-                    format_price(signal_result["stop_loss"])
-                    if signal_result["stop_loss"] is not None
-                    else "—"
-                ),
-            )
-
-            p3.metric(
-                "Take Profit",
-                (
-                    format_price(signal_result["take_profit"])
-                    if signal_result["take_profit"] is not None
-                    else "—"
-                ),
-            )
+                p3.metric(
+                    "Take Profit",
+                    format_price(signal_result["take_profit"]),
+                )
+            else:
+                st.info(
+                    "Aucun niveau d'entrée, de SL ou de TP "
+                    "n'est proposé tant que le signal reste ATTENDRE."
+        )
 
             with st.expander("Pourquoi ce résultat ?"):
                 for reason in signal_result["reasons"]:
