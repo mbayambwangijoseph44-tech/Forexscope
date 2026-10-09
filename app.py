@@ -541,6 +541,191 @@ def analyze_multiple_timeframes(symbol, count=300):
     return results
     
 # =========================================================
+# 5G. MOTEUR DE SIGNAUX FOREXSCOPE
+# =========================================================
+
+def generate_trading_signal(raw_data, multi_results):
+    """
+    Génère un signal indicatif à partir des indicateurs,
+    de la structure et de la confluence multi-unités de temps.
+
+    Le score est un score de confluence, pas une probabilité
+    statistique de gain.
+    """
+
+    neutral_result = {
+        "signal": "ATTENDRE",
+        "confidence": 0,
+        "entry": None,
+        "stop_loss": None,
+        "take_profit": None,
+        "risk_reward": None,
+        "reasons": ["Données insuffisantes pour décider."],
+    }
+
+    if raw_data is None or len(raw_data) < 50:
+        return neutral_result
+
+    df = calculate_indicators(raw_data)
+    df = df.dropna(subset=["ema_20", "ema_50", "rsi", "atr"])
+
+    if len(df) < 2:
+        return neutral_result
+
+    # Utilise la dernière bougie clôturée.
+    last = df.iloc[-2]
+
+    close = float(last["close"])
+    atr = float(last["atr"])
+    rsi = float(last["rsi"])
+
+    if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
+        return neutral_result
+
+    bullish_score = 0
+    bearish_score = 0
+    reasons = []
+
+    # 1. Tendance locale : EMA
+    if last["ema_20"] > last["ema_50"]:
+        bullish_score += 2
+        reasons.append("EMA 20 supérieure à EMA 50.")
+    elif last["ema_20"] < last["ema_50"]:
+        bearish_score += 2
+        reasons.append("EMA 20 inférieure à EMA 50.")
+
+    # 2. Position du prix
+    if close > last["ema_20"]:
+        bullish_score += 1
+    elif close < last["ema_20"]:
+        bearish_score += 1
+
+    # 3. RSI : momentum, sans acheter automatiquement en survente
+    if 50 < rsi < 70:
+        bullish_score += 1
+        reasons.append("RSI favorable au momentum haussier.")
+    elif 30 < rsi < 50:
+        bearish_score += 1
+        reasons.append("RSI favorable au momentum baissier.")
+    elif rsi >= 70:
+        reasons.append("RSI élevé : risque de poursuite tardive.")
+    elif rsi <= 30:
+        reasons.append("RSI faible : risque de vente tardive.")
+
+    # 4. MACD
+    if last["macd"] > last["macd_signal"]:
+        bullish_score += 1
+    elif last["macd"] < last["macd_signal"]:
+        bearish_score += 1
+
+    # 5. Balayage de liquidité sur les bougies clôturées
+    closed = df.iloc[:-1].copy()
+    sweep = detect_liquidity_sweep(closed)
+
+    if sweep["sweep"] == "Sweep haussier potentiel":
+        bullish_score += 2
+        reasons.append("Balayage haussier potentiel détecté.")
+    elif sweep["sweep"] == "Sweep baissier potentiel":
+        bearish_score += 2
+        reasons.append("Balayage baissier potentiel détecté.")
+
+    # 6. Confluence des unités supérieures.
+    # On ne compte pas l'unité locale deux fois si elle
+    # apparaît dans la liste multi-unités.
+    higher_timeframes = ["M15", "M30", "H1", "H4", "D1"]
+
+    for tf in higher_timeframes:
+        result = multi_results.get(tf, {})
+
+        if result.get("status") != "OK":
+            continue
+
+        bias = result.get("bias")
+
+        if bias == "Haussier":
+            bullish_score += 1
+        elif bias == "Baissier":
+            bearish_score += 1
+
+    total_score = bullish_score + bearish_score
+
+    if total_score == 0:
+        return {
+            **neutral_result,
+            "reasons": ["Aucun élément directionnel suffisamment clair."],
+        }
+
+    # Une direction ne suffit pas : il faut une marge
+    # minimale entre les scores et une confluence suffisante.
+    score_difference = abs(bullish_score - bearish_score)
+
+    if (
+        bullish_score >= 5
+        and bullish_score > bearish_score
+        and score_difference >= 2
+    ):
+        signal = "ACHAT"
+        winning_score = bullish_score
+        direction = 1
+
+    elif (
+        bearish_score >= 5
+        and bearish_score > bullish_score
+        and score_difference >= 2
+    ):
+        signal = "VENTE"
+        winning_score = bearish_score
+        direction = -1
+
+    else:
+        signal = "ATTENDRE"
+        winning_score = max(bullish_score, bearish_score)
+        direction = 0
+        reasons.append(
+            "Confluence insuffisante ou signaux contradictoires."
+        )
+
+    # Score normalisé de confluence : ce n'est pas une
+    # probabilité de réussite.
+    confidence = round(
+        100 * winning_score / max(total_score, 1)
+    )
+
+    entry = close
+    stop_loss = None
+    take_profit = None
+    risk_reward = None
+
+    if direction != 0:
+        # Distance de protection fondée sur l'ATR.
+        risk_distance = 1.5 * atr
+        reward_distance = 3.0 * atr
+
+        if direction == 1:
+            stop_loss = entry - risk_distance
+            take_profit = entry + reward_distance
+        else:
+            stop_loss = entry + risk_distance
+            take_profit = entry - reward_distance
+
+        risk_reward = reward_distance / risk_distance
+
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "risk_reward": risk_reward,
+        "bullish_score": bullish_score,
+        "bearish_score": bearish_score,
+        "reasons": reasons,
+        "rsi": rsi,
+        "atr": atr,
+    }
+    
+    
+# =========================================================
 # 6. FONCTIONS D'AFFICHAGE
 # =========================================================
 
@@ -902,6 +1087,71 @@ with tab_analysis:
                     "Aucune unité de temps n'a fourni assez de "
                     "données valides pour une analyse."
 )
+ 
+            st.divider()
+            st.markdown("### Signal ForexScope")
+
+            signal_result = generate_trading_signal(
+                candles,
+                multi_results,
+            )
+
+            s1, s2, s3 = st.columns(3)
+
+            s1.metric("Décision", signal_result["signal"])
+            s2.metric(
+                "Score de confluence",
+                f"{signal_result['confidence']} / 100",
+            )
+
+            s3.metric(
+                "Ratio risque/rendement",
+                (
+                    f"1:{signal_result['risk_reward']:.1f}"
+                    if signal_result["risk_reward"] is not None
+                    else "Non défini"
+                ),
+            )
+
+            if signal_result["signal"] == "ACHAT":
+                st.success("Biais haussier détecté. Vérifie le contexte avant toute entrée.")
+            elif signal_result["signal"] == "VENTE":
+                st.error("Biais baissier détecté. Vérifie le contexte avant toute entrée.")
+            else:
+                st.warning("Pas de confluence suffisante : aucune entrée proposée.")
+
+            p1, p2, p3 = st.columns(3)
+
+            p1.metric(
+                "Entrée indicative",
+                (
+                    format_price(signal_result["entry"])
+                    if signal_result["entry"] is not None
+                    else "—"
+                ),
+            )
+
+            p2.metric(
+                "Stop Loss",
+                (
+                    format_price(signal_result["stop_loss"])
+                    if signal_result["stop_loss"] is not None
+                    else "—"
+                ),
+            )
+
+            p3.metric(
+                "Take Profit",
+                (
+                    format_price(signal_result["take_profit"])
+                    if signal_result["take_profit"] is not None
+                    else "—"
+                ),
+            )
+
+            with st.expander("Pourquoi ce résultat ?"):
+                for reason in signal_result["reasons"]:
+                    st.write(f"- {reason}")
         
 with tab_history:
     st.subheader("Historique")
