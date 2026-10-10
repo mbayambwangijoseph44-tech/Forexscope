@@ -4,7 +4,8 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timezone
 
 # =========================================================
 # 1. CONFIGURATION DE L'APPLICATION
@@ -723,7 +724,88 @@ def generate_trading_signal(raw_data, multi_results):
         "rsi": rsi,
         "atr": atr,
     }
-    
+    # 5G. HISTORIQUE PERMANENT DES SIGNAUX
+
+DB_PATH = "forexscope.db"
+
+
+def init_signal_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                market TEXT,
+                symbol TEXT,
+                timeframe TEXT,
+                signal TEXT,
+                confidence INTEGER,
+                entry REAL,
+                stop_loss REAL,
+                take_profit REAL,
+                reasons TEXT
+            )
+        """)
+        conn.commit()
+
+
+def save_signal_record(market, symbol, timeframe, result):
+    created_at_utc = datetime.now(timezone.utc).isoformat(
+        timespec="seconds"
+    )
+
+    reasons = "\n".join(result.get("reasons", []))
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("""
+            INSERT INTO signals (
+                created_at_utc, market, symbol, timeframe,
+                signal, confidence, entry, stop_loss,
+                take_profit, reasons
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            created_at_utc,
+            market,
+            symbol,
+            timeframe,
+            result.get("signal"),
+            result.get("confidence"),
+            result.get("entry"),
+            result.get("stop_loss"),
+            result.get("take_profit"),
+            reasons
+        ))
+        conn.commit()
+        signal_id = cursor.lastrowid
+
+    return signal_id, created_at_utc
+
+
+def get_signal_history(limit=100):
+    with sqlite3.connect(DB_PATH) as conn:
+        history = pd.read_sql_query("""
+            SELECT
+                id AS ID,
+                created_at_utc AS "Créé à (UTC)",
+                market AS Marché,
+                symbol AS Symbole,
+                timeframe AS Unité,
+                signal AS Signal,
+                confidence AS "Confiance",
+                entry AS Entrée,
+                stop_loss AS "Stop Loss",
+                take_profit AS "Take Profit",
+                reasons AS Raisons
+            FROM signals
+            ORDER BY id DESC
+            LIMIT ?
+        """, conn, params=(int(limit),))
+
+    return history
+
+
+init_signal_db()
     
 # =========================================================
 # 6. FONCTIONS D'AFFICHAGE
