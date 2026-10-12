@@ -1207,12 +1207,12 @@ s3.metric(
             "Ratio risque/rendement",
                 (
                     f"1:{signal_result['risk_reward']:.1f}"
- if signal_result["risk_reward"] is not None
+if signal_result["risk_reward"] is not None
 else "Non défini"
                 ),
             )
 
- if signal_result["signal"] == "ACHAT":
+if signal_result["signal"] == "ACHAT":
                 st.success("Biais haussier détecté. Vérifie le contexte avant toute entrée.")
 elif signal_result["signal"] == "VENTE":
                 st.error("Biais baissier détecté. Vérifie le contexte avant toute entrée.")
