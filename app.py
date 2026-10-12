@@ -1241,7 +1241,7 @@ else:
                     "n'est proposé tant que le signal reste ATTENDRE."
         )
 
- with st.expander("Pourquoi ce résultat ?"):
+with st.expander("Pourquoi ce résultat ?"):
      for reason in signal_result["reasons"]:
                     st.write(f"- {reason}")
         
@@ -1252,7 +1252,7 @@ with tab_history:
 
 if history.empty:
         st.info("Aucun signal enregistré pour le moment.")
- else:
+else:
      history["Créé à (UTC)"] = (
             pd.to_datetime(
                 history["Créé à (UTC)"],
