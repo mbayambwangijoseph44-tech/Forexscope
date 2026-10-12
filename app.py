@@ -1,1356 +1,846 @@
 
-import json
 import os
 import sqlite3
-import time
 from datetime import datetime, timezone
-
-import websocket
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-if st.button("Tester la connexion Deriv"):
-    with st.spinner("Test en cours..."):
-        st.code(test_deriv_connection())
+import yfinance as yf
 
-# =========================================================
-# 1. CONFIGURATION
-# =========================================================
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 st.set_page_config(
     page_title="ForexScope",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
+APP_NAME = "ForexScope"
 DB_PATH = "forexscope.db"
 
-# Symboles Deriv. Certains actifs peuvent ne pas être disponibles sur tous les comptes/régions.
 SYMBOLS = {
-    "EUR/USD": "frxEURUSD",
-    "GBP/USD": "frxGBPUSD",
-    "USD/JPY": "frxUSDJPY",
-    "AUD/USD": "frxAUDUSD",
-    "USD/CAD": "frxUSDCAD",
-    "USD/CHF": "frxUSDCHF",
-    "NZD/USD": "frxNZDUSD",
-    "EUR/GBP": "frxEURGBP",
-    "EUR/JPY": "frxEURJPY",
-    "GBP/JPY": "frxGBPJPY",
-    "Or (Gold)": "frxXAUUSD",
-    "Bitcoin / USD": "cryBTCUSD",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "CAD=X",
+    "USD/CHF": "CHF=X",
+    "NZD/USD": "NZDUSD=X",
+    "EUR/GBP": "EURGBP=X",
+    "EUR/JPY": "EURJPY=X",
+    "GBP/JPY": "GBPJPY=X",
+    "Or (Gold)": "GC=F",
+    "Bitcoin / USD": "BTC-USD",
 }
 
-INTERVALS = {
-    "M1": {"granularity": 60},
-    "M5": {"granularity": 300},
-    "M15": {"granularity": 900},
-    "M30": {"granularity": 1800},
-    "H1": {"granularity": 3600},
-    "H4": {"granularity": 14400},
-    "D1": {"granularity": 86400},
+TIMEFRAMES = {
+    "M1": {"interval": "1m", "period": "7d"},
+    "M5": {"interval": "5m", "period": "60d"},
+    "M15": {"interval": "15m", "period": "60d"},
+    "M30": {"interval": "30m", "period": "60d"},
+    "H1": {"interval": "60m", "period": "2y"},
+    "H4": {"interval": "60m", "period": "2y"},
+    "D1": {"interval": "1d", "period": "5y"},
 }
 
-DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
-DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-def test_deriv_connection():
-    import websocket
-    import json
-
-    try:
-        ws = websocket.create_connection(
-            DERIV_WS_URL,
-            timeout=10
-        )
-        ws.send(json.dumps({"ping": 1}))
-        response = json.loads(ws.recv())
-        ws.close()
-
-        return f"Connexion réussie : {response}"
-
-    except Exception as e:
-        return f"Échec du test : {type(e).__name__}: {e}"
-st.markdown(
-    """
-    <style>
-        .block-container {
-            padding-top: 1.5rem;
-            padding-bottom: 2rem;
-            max-width: 1500px;
-        }
-        [data-testid="stMetric"] {
-            background: rgba(128, 128, 128, 0.08);
-            border: 1px solid rgba(128, 128, 128, 0.2);
-            padding: 16px;
-            border-radius: 12px;
-        }
-        div[data-testid="stTabs"] button {
-            font-weight: 600;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+TIMEFRAME_ORDER = ["M5", "M15", "M30", "H1", "H4", "D1"]
 
 
-# =========================================================
-# 2. DATA VALIDATION AND RETRIEVAL
-# =========================================================
+# ============================================================
+# NORMALISATION DES BOUGIES
+# ============================================================
+
 def validate_ohlc(data):
-    """Clean and validate OHLC data."""
-    if data is None or data.empty:
-        return pd.DataFrame()
-
-    data = data.copy()
-
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-
-    data.columns = [str(c).strip().lower() for c in data.columns]
-    required = ["open", "high", "low", "close"]
-
-    if not all(c in data.columns for c in required):
-        return pd.DataFrame()
-
-    if "time" not in data.columns:
-        data["time"] = data.index
-
-    for column in required:
-        data[column] = pd.to_numeric(data[column], errors="coerce")
-
-    data["time"] = pd.to_datetime(data["time"], errors="coerce", utc=True)
-    data = data.dropna(subset=["time", "open", "high", "low", "close"])
-
-    data = data[
-        (data["high"] >= data["low"])
-        & (data["high"] >= data["open"])
-        & (data["high"] >= data["close"])
-        & (data["low"] <= data["open"])
-        & (data["low"] <= data["close"])
-        & (data["close"] > 0)
-    ]
-
-    data = (
-        data.sort_values("time")
-        .drop_duplicates(subset=["time"])
-        .reset_index(drop=True)
-    )
-    return data[["time", "open", "high", "low", "close"]]
-
-
-def _deriv_request(payload, timeout=15):
-    """Send one public request to Deriv and always close the socket."""
-    ws = None
-    try:
-        ws = websocket.create_connection(
-    DERIV_WS_URL,
-    timeout=timeout
-)
-        ws.send(json.dumps(payload))
-        deadline = time.time() + timeout
-
-        while time.time() < deadline:
-            response = json.loads(ws.recv())
-
-            if response.get("error"):
-                err = response["error"]
-                raise RuntimeError(
-                    f"Deriv ({err.get('code', 'erreur')}): "
-                    f"{err.get('message', 'requête refusée')}"
-                )
-
-            if response.get("msg_type"):
-                return response
-
-        raise TimeoutError("Délai dépassé en attendant la réponse de Deriv.")
-
-    except Exception as exc:
-        raise RuntimeError(str(exc)) from exc
-
-    finally:
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
-
-
-@st.cache_data(ttl=20, show_spinner=False)
-def fetch_candles(symbol, timeframe, count=300):
-    """Fetch real OHLC candles from Deriv; never fall back to simulated data."""
-    if timeframe not in INTERVALS:
-        return pd.DataFrame()
-
-    count = max(50, min(int(count), 1000))
-
-    payload = {
-        "ticks_history": symbol,
-        "adjust_start_time": 1,
-        "count": count,
-        "end": "latest",
-        "style": "candles",
-        "granularity": INTERVALS[timeframe]["granularity"],
-        "subscribe": 0,
-    }
-
-    try:
-        response = _deriv_request(payload)
-        candles = response.get("candles", [])
-
-        if not candles:
-            return pd.DataFrame()
-
-        data = pd.DataFrame(candles).rename(columns={"epoch": "time"})
-        data["time"] = pd.to_datetime(
-            data["time"],
-            unit="s",
-            utc=True,
-            errors="coerce",
-        )
-
-        return validate_ohlc(data).tail(count).reset_index(drop=True)
-
-    except Exception:
-        # Errors are exposed separately by get_connection_status.
-        # No other data provider is used.
-        return pd.DataFrame()
-
-
-@st.cache_data(ttl=20, show_spinner=False)
-def get_connection_status(symbol):
-    """Return explicit Deriv connectivity/data status for the selected symbol."""
-    try:
-        response = _deriv_request({
-            "ticks_history": symbol,
-            "adjust_start_time": 1,
-            "count": 2,
-            "end": "latest",
-            "style": "candles",
-            "granularity": 60,
-            "subscribe": 0,
-        })
-
-        n = len(response.get("candles", []))
-
-        if n:
-            return {
-                "ok": True,
-                "message": "Connexion Deriv active — données de marché reçues.",
-            }
-
-        return {
-            "ok": False,
-            "message": "Deriv a répondu, mais aucune bougie n'est disponible pour ce symbole.",
-        }
-
-    except Exception as exc:
-        return {
-            "ok": False,
-            "message": f"Connexion Deriv indisponible : {exc}",
-        }
-
-
-# =========================================================
-# 3. TECHNICAL INDICATORS
-# =========================================================
-def calculate_indicators(data):
+    """Normalise les colonnes et vérifie les bougies OHLC."""
     if data is None or data.empty:
         return pd.DataFrame()
 
     df = data.copy()
-    close, high, low = df["close"], df["high"], df["low"]
 
-    df["ema_20"] = close.ewm(span=20, adjust=False).mean()
-    df["ema_50"] = close.ewm(span=50, adjust=False).mean()
-    df["ema_200"] = close.ewm(span=200, adjust=False).mean()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-    delta = close.diff()
-    gains = delta.clip(lower=0)
-    losses = -delta.clip(upper=0)
+    df.columns = [str(c).lower() for c in df.columns]
 
-    avg_gain = gains.ewm(
-        alpha=1 / 14,
-        min_periods=14,
-        adjust=False,
+    required = ["open", "high", "low", "close"]
+    if not all(c in df.columns for c in required):
+        return pd.DataFrame()
+
+    if "time" not in df.columns:
+        df["time"] = df.index
+
+    df["time"] = pd.to_datetime(
+        df["time"], utc=True, errors="coerce"
+    )
+
+    for col in required:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "volume" not in df.columns:
+        df["volume"] = 0
+
+    df["volume"] = pd.to_numeric(
+        df["volume"], errors="coerce"
+    ).fillna(0)
+
+    df = df.dropna(
+        subset=["time", "open", "high", "low", "close"]
+    )
+
+    df = df[
+        (df["high"] >= df["low"])
+        & (df["high"] >= df["open"])
+        & (df["high"] >= df["close"])
+        & (df["low"] <= df["open"])
+        & (df["low"] <= df["close"])
+        & (df["close"] > 0)
+    ]
+
+    df = df.sort_values("time")
+    df = df.drop_duplicates(subset=["time"], keep="last")
+    return df.reset_index(drop=True)
+
+
+# ============================================================
+# SOURCE YAHOO FINANCE
+# ============================================================
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_candles(symbol, timeframe, count=300):
+    """
+    Télécharge les bougies Yahoo Finance.
+    Pour H4, les bougies horaires sont regroupées en bougies de 4 heures.
+    """
+    if timeframe not in TIMEFRAMES:
+        return pd.DataFrame()
+
+    settings = TIMEFRAMES[timeframe]
+
+    try:
+        raw = yf.download(
+            tickers=symbol,
+            period=settings["period"],
+            interval=settings["interval"],
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            multi_level_index=False,
+        )
+
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+
+        raw.columns = [str(c).lower() for c in raw.columns]
+
+        needed = ["open", "high", "low", "close"]
+        if not all(c in raw.columns for c in needed):
+            return pd.DataFrame()
+
+        raw = raw.copy()
+        raw.index = pd.to_datetime(raw.index, utc=True)
+
+        if timeframe == "H4":
+            raw = raw.resample(
+                "4h", label="left", closed="left"
+            ).agg({
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                **(
+                    {"volume": "sum"}
+                    if "volume" in raw.columns
+                    else {}
+                ),
+            }).dropna(subset=needed)
+
+        raw = raw.tail(int(count)).copy()
+        raw["time"] = raw.index
+
+        if "volume" not in raw.columns:
+            raw["volume"] = 0
+
+        return validate_ohlc(raw.reset_index(drop=True))
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_connection_status(symbol):
+    """Vérifie si Yahoo Finance fournit des données pour le symbole."""
+    try:
+        check = yf.download(
+            tickers=symbol,
+            period="5d",
+            interval="1d",
+            progress=False,
+            threads=False,
+            auto_adjust=False,
+            multi_level_index=False,
+        )
+
+        if check is not None and not check.empty:
+            return {
+                "ok": True,
+                "message": "Connexion Yahoo Finance opérationnelle.",
+            }
+
+        return {
+            "ok": False,
+            "message": (
+                "Yahoo Finance n'a retourné aucune donnée pour ce symbole."
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "message": f"Erreur Yahoo Finance : {exc}",
+        }
+
+
+# ============================================================
+# INDICATEURS TECHNIQUES
+# ============================================================
+
+def add_indicators(data):
+    df = validate_ohlc(data)
+
+    if df.empty:
+        return df
+
+    df["ema20"] = df["close"].ewm(
+        span=20, adjust=False
     ).mean()
 
-    avg_loss = losses.ewm(
-        alpha=1 / 14,
-        min_periods=14,
-        adjust=False,
+    df["ema50"] = df["close"].ewm(
+        span=50, adjust=False
+    ).mean()
+
+    df["ema200"] = df["close"].ewm(
+        span=200, adjust=False
+    ).mean()
+
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / 14, min_periods=14, adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / 14, min_periods=14, adjust=False
     ).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
-    df.loc[avg_loss == 0, "rsi"] = 100
 
-    previous_close = close.shift(1)
+    previous_close = df["close"].shift(1)
 
     true_range = pd.concat(
         [
-            high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs(),
+            df["high"] - df["low"],
+            (df["high"] - previous_close).abs(),
+            (df["low"] - previous_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
     df["atr"] = true_range.ewm(
-        alpha=1 / 14,
-        min_periods=14,
-        adjust=False,
+        alpha=1 / 14, min_periods=14, adjust=False
     ).mean()
 
-    ema_12 = close.ewm(span=12, adjust=False).mean()
-    ema_26 = close.ewm(span=26, adjust=False).mean()
+    ema12 = df["close"].ewm(
+        span=12, adjust=False
+    ).mean()
 
-    df["macd"] = ema_12 - ema_26
+    ema26 = df["close"].ewm(
+        span=26, adjust=False
+    ).mean()
+
+    df["macd"] = ema12 - ema26
+
     df["macd_signal"] = df["macd"].ewm(
-        span=9,
-        adjust=False,
-    ).mean()
-
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
-
-    up_move = high.diff()
-    down_move = -low.diff()
-
-    plus_dm = pd.Series(
-        np.where(
-            (up_move > down_move) & (up_move > 0),
-            up_move,
-            0.0,
-        ),
-        index=df.index,
-    )
-
-    minus_dm = pd.Series(
-        np.where(
-            (down_move > up_move) & (down_move > 0),
-            down_move,
-            0.0,
-        ),
-        index=df.index,
-    )
-
-    atr_safe = df["atr"].replace(0, np.nan)
-
-    plus_di = (
-        100
-        * plus_dm.ewm(
-            alpha=1 / 14,
-            min_periods=14,
-            adjust=False,
-        ).mean()
-        / atr_safe
-    )
-
-    minus_di = (
-        100
-        * minus_dm.ewm(
-            alpha=1 / 14,
-            min_periods=14,
-            adjust=False,
-        ).mean()
-        / atr_safe
-    )
-
-    di_sum = (plus_di + minus_di).replace(0, np.nan)
-    dx = 100 * (plus_di - minus_di).abs() / di_sum
-
-    df["plus_di"] = plus_di
-    df["minus_di"] = minus_di
-
-    df["adx"] = dx.ewm(
-        alpha=1 / 14,
-        min_periods=14,
-        adjust=False,
+        span=9, adjust=False
     ).mean()
 
     return df
 
+# ============================================================
+# STRUCTURE DU MARCHE ET LIQUIDITE
+# ============================================================
 
 def analyze_market_structure(data, lookback=20):
-    """Describe a simple close-confirmed break of the prior range."""
-    result = {
-        "structure": "Données insuffisantes",
-        "bias": "Neutre",
-        "last_high": None,
-        "last_low": None,
-        "breakout": None,
-    }
-
-    if data is None or len(data) < max(lookback + 1, 10):
-        return result
-
-    recent = data.tail(lookback + 1).copy()
-    previous = recent.iloc[:-1]
-    current = recent.iloc[-1]
-
-    if previous.empty:
-        return result
-
-    prior_high = float(previous["high"].max())
-    prior_low = float(previous["low"].min())
-    close = float(current["close"])
-
-    result["last_high"] = prior_high
-    result["last_low"] = prior_low
-
-    if close > prior_high:
-        result.update(
-            structure="Cassure haussière (BOS potentiel)",
-            bias="Haussier",
-            breakout="HAUSSIER",
-        )
-
-    elif close < prior_low:
-        result.update(
-            structure="Cassure baissière (BOS potentiel)",
-            bias="Baissier",
-            breakout="BAISSIER",
-        )
-
-    else:
-        first_close = float(previous["close"].iloc[0])
-
-        if close > first_close:
-            result.update(
-                structure="Progression haussière sans cassure",
-                bias="Haussier",
-            )
-
-        elif close < first_close:
-            result.update(
-                structure="Progression baissière sans cassure",
-                bias="Baissier",
-            )
-
-        else:
-            result.update(
-                structure="Range / neutre",
-                bias="Neutre",
-            )
-
-    return result
-
-
-def detect_liquidity_sweep(data, lookback=20):
-    """Detect a sweep on the final candle of the supplied dataset."""
-    result = {
-        "sweep": "Aucun balayage détecté",
-        "level": None,
-        "extreme": None,
-        "index": None,
-    }
-
-    if data is None or len(data) < lookback + 1:
-        return result
-
-    previous = data.iloc[-(lookback + 1):-1]
-    last = data.iloc[-1]
-
-    previous_low = float(previous["low"].min())
-    previous_high = float(previous["high"].max())
-
-    low = float(last["low"])
-    high = float(last["high"])
-    close = float(last["close"])
-
-    if low < previous_low and close > previous_low:
-        result.update(
-            sweep="Sweep haussier potentiel",
-            level=previous_low,
-            extreme=low,
-            index=len(data) - 1,
-        )
-
-    elif high > previous_high and close < previous_high:
-        result.update(
-            sweep="Sweep baissier potentiel",
-            level=previous_high,
-            extreme=high,
-            index=len(data) - 1,
-        )
-
-    return result
-
-
-def _is_impulsive_candle(candle, atr, direction):
-    """Require directional body size and a decisive close within the range."""
-    if not np.isfinite(atr) or atr <= 0:
-        return False
-
-    open_price = float(candle["open"])
-    high = float(candle["high"])
-    low = float(candle["low"])
-    close = float(candle["close"])
-
-    candle_range = high - low
-    body = abs(close - open_price)
-
-    if candle_range <= 0 or body < 0.65 * atr or body / candle_range < 0.55:
-        return False
-
-    if direction == "Haussier":
-        return close > open_price and (high - close) / candle_range <= 0.25
-
-    return close < open_price and (close - low) / candle_range <= 0.25
-
-def _find_confirmed_smc_setup(closed, atr, lookback=20, sweep_window=6):
-    """Find sweep -> later structure break -> impulse using closed candles only."""
-    empty = {
-        "direction": None,
-        "sweep_extreme": None,
-        "reasons": [],
-    }
-
-    if closed is None or len(closed) < lookback + 3:
-        return empty
-
-    # The final candle is the potential confirmation candle.
-    # A sweep alone is never an entry signal.
-    current = closed.iloc[-1]
-    current_index = len(closed) - 1
-    first_sweep_index = max(lookback, current_index - sweep_window)
-
-    for sweep_idx in range(
-        current_index - 1,
-        first_sweep_index - 1,
-        -1,
-    ):
-        sweep_candle = closed.iloc[sweep_idx]
-        prior = closed.iloc[max(0, sweep_idx - lookback):sweep_idx]
-
-        if len(prior) < min(lookback, 10):
-            continue
-
-        prior_low = float(prior["low"].min())
-        prior_high = float(prior["high"].max())
-
-        sweep_low = float(sweep_candle["low"])
-        sweep_high = float(sweep_candle["high"])
-        sweep_close = float(sweep_candle["close"])
-
-        if sweep_low < prior_low and sweep_close > prior_low:
-            direction = "Haussier"
-            extreme = sweep_low
-
-            later = closed.iloc[sweep_idx + 1:current_index]
-
-            reference = (
-                float(later["high"].max())
-                if not later.empty
-                else float(prior["high"].tail(5).max())
-            )
-
-            broken = float(current["close"]) > reference
-
-        elif sweep_high > prior_high and sweep_close < prior_high:
-            direction = "Baissier"
-            extreme = sweep_high
-
-            later = closed.iloc[sweep_idx + 1:current_index]
-
-            reference = (
-                float(later["low"].min())
-                if not later.empty
-                else float(prior["low"].tail(5).min())
-            )
-
-            broken = float(current["close"]) < reference
-
-        else:
-            continue
-
-        if broken and _is_impulsive_candle(current, atr, direction):
-            return {
-                "direction": direction,
-                "sweep_extreme": extreme,
-                "reasons": [
-                    f"Sweep {direction.lower()} détecté sur une bougie clôturée.",
-                    f"Cassure de structure {direction.lower()} après le sweep.",
-                    "Bougie de confirmation impulsive.",
-                ],
-            }
-
-    return empty
-
-
-def analyze_timeframe(raw_data):
-    insufficient = {
-        "status": "Données insuffisantes",
-        "bias": "Neutre",
-        "rsi": None,
-        "adx": None,
-        "atr": None,
-        "macd": "Indisponible",
-        "structure": "Indisponible",
-        "sweep": "Indisponible",
-        "close": None,
-        "candle_time": None,
-    }
-
-    if raw_data is None or len(raw_data) < 50:
-        return insufficient
-
-    df = calculate_indicators(raw_data)
-    df = df.dropna(
-        subset=["ema_20", "ema_50", "rsi", "atr"],
-    )
-
-    if df.empty:
+    if data is None or len(data) < lookback + 5:
         return {
-            **insufficient,
-            "status": "Indicateurs indisponibles",
+            "trend": "Indéterminée",
+            "structure": "Données insuffisantes",
+            "liquidity": "Non déterminée",
+            "sweep": None,
         }
 
-    closed = df.iloc[:-1].copy() if len(df) >= 2 else df.copy()
-    last = closed.iloc[-1]
+    df = data.copy()
+    recent = df.tail(lookback)
+    previous = df.iloc[-lookback - 1:-1]
 
-    bullish_points = 0
-    bearish_points = 0
+    last = df.iloc[-1]
 
-    if last["close"] > last["ema_20"]:
-        bullish_points += 1
-    elif last["close"] < last["ema_20"]:
-        bearish_points += 1
+    recent_high = recent["high"].max()
+    recent_low = recent["low"].min()
+    previous_high = previous["high"].max()
+    previous_low = previous["low"].min()
 
-    if last["ema_20"] > last["ema_50"]:
-        bullish_points += 1
-    elif last["ema_20"] < last["ema_50"]:
-        bearish_points += 1
-
-    if last["macd"] > last["macd_signal"]:
-        bullish_points += 1
-    elif last["macd"] < last["macd_signal"]:
-        bearish_points += 1
-
-    if last["rsi"] > 55:
-        bullish_points += 1
-    elif last["rsi"] < 45:
-        bearish_points += 1
-
-    if bullish_points > bearish_points:
-        bias = "Haussier"
-    elif bearish_points > bullish_points:
-        bias = "Baissier"
+    if last["close"] > previous_high:
+        structure = "Cassure haussière (BOS)"
+    elif last["close"] < previous_low:
+        structure = "Cassure baissière (BOS)"
     else:
-        bias = "Neutre"
+        structure = "Structure en consolidation"
 
-    structure = analyze_market_structure(closed)
-    sweep = detect_liquidity_sweep(closed)
-
-    if last["macd"] > last["macd_signal"]:
-        macd_state = "Haussier"
-    elif last["macd"] < last["macd_signal"]:
-        macd_state = "Baissier"
+    if last["ema20"] > last["ema50"]:
+        trend = "Haussière"
+    elif last["ema20"] < last["ema50"]:
+        trend = "Baissière"
     else:
-        macd_state = "Neutre"
+        trend = "Neutre"
+
+    sweep = None
+
+    # Détection simplifiée d'une prise de liquidité :
+    # mèche sous le plus bas précédent puis clôture au-dessus.
+    if (
+        last["low"] < previous_low
+        and last["close"] > previous_low
+    ):
+        sweep = "Bullish liquidity sweep"
+
+    elif (
+        last["high"] > previous_high
+        and last["close"] < previous_high
+    ):
+        sweep = "Bearish liquidity sweep"
+
+    liquidity = (
+        f"Zone haute : {recent_high:.5f} | "
+        f"Zone basse : {recent_low:.5f}"
+    )
 
     return {
-        "status": "OK",
-        "bias": bias,
-        "rsi": float(last["rsi"]),
-        "adx": float(last["adx"]) if pd.notna(last["adx"]) else None,
-        "atr": float(last["atr"]),
-        "macd": macd_state,
-        "structure": structure["structure"],
-        "sweep": sweep["sweep"],
-        "close": float(last["close"]),
-        "ema_20": float(last["ema_20"]),
-        "ema_50": float(last["ema_50"]),
-        "ema_200": (
-            float(last["ema_200"])
-            if pd.notna(last["ema_200"])
-            else None
-        ),
-        "bullish_points": bullish_points,
-        "bearish_points": bearish_points,
-        "candle_time": last["time"],
+        "trend": trend,
+        "structure": structure,
+        "liquidity": liquidity,
+        "sweep": sweep,
+        "recent_high": float(recent_high),
+        "recent_low": float(recent_low),
     }
 
 
-def analyze_multiple_timeframes(symbol, count=300):
+def analyze_timeframe(symbol, timeframe, count=300):
+    candles = fetch_candles(symbol, timeframe, count)
+
+    if candles.empty or len(candles) < 60:
+        return {
+            "ok": False,
+            "timeframe": timeframe,
+            "message": "Historique insuffisant pour cette unité.",
+        }
+
+    df = add_indicators(candles)
+    df = df.dropna(subset=["ema20", "ema50", "rsi", "atr"])
+
+    if len(df) < 5:
+        return {
+            "ok": False,
+            "timeframe": timeframe,
+            "message": "Indicateurs non disponibles.",
+        }
+
+    last = df.iloc[-1]
+    structure = analyze_market_structure(df)
+
+    if last["ema20"] > last["ema50"]:
+        direction = "Achat"
+    elif last["ema20"] < last["ema50"]:
+        direction = "Vente"
+    else:
+        direction = "Neutre"
+
+    return {
+        "ok": True,
+        "timeframe": timeframe,
+        "direction": direction,
+        "trend": structure["trend"],
+        "structure": structure["structure"],
+        "liquidity": structure["liquidity"],
+        "sweep": structure["sweep"],
+        "rsi": float(last["rsi"]),
+        "atr": float(last["atr"]),
+        "close": float(last["close"]),
+        "ema20": float(last["ema20"]),
+        "ema50": float(last["ema50"]),
+        "macd": float(last["macd"]),
+        "macd_signal": float(last["macd_signal"]),
+        "data": df,
+    }
+
+
+# ============================================================
+# ANALYSE MULTI-UNITES DE TEMPS
+# ============================================================
+
+def multi_timeframe_analysis(symbol):
     results = {}
 
-    for tf in ["M5", "M15", "M30", "H1", "H4", "D1"]:
-        raw_data = fetch_candles(symbol, tf, count)
-
-        if raw_data.empty:
-            results[tf] = {
-                "status": "Données indisponibles",
-                "bias": "Neutre",
-                "rsi": None,
-                "adx": None,
-                "atr": None,
-                "macd": "Indisponible",
-                "structure": "Indisponible",
-                "sweep": "Indisponible",
-                "close": None,
-                "candle_time": None,
-            }
-
-        else:
-            results[tf] = analyze_timeframe(raw_data)
-
-    return results
-
-
-# =========================================================
-# 4. SIGNAL ENGINE
-# =========================================================
-def generate_trading_signal(raw_data, multi_results):
-    """Generate a conservative signal only after sweep, BOS and impulse align."""
-    neutral_result = {
-        "signal": "ATTENDRE",
-        "confidence": 0,
-        "setup_quality": 0,
-        "confirmation": "Non confirmée",
-        "bias": "Neutre",
-        "entry": None,
-        "stop_loss": None,
-        "take_profit": None,
-        "risk_reward": None,
-        "reasons": ["Données insuffisantes pour décider."],
-        "rsi": None,
-        "atr": None,
-        "bullish_score": 0,
-        "bearish_score": 0,
-        "candle_time": None,
-    }
-
-    if raw_data is None or len(raw_data) < 60:
-        return neutral_result
-
-    df = calculate_indicators(raw_data)
-    df = df.dropna(
-        subset=["ema_20", "ema_50", "rsi", "atr"],
-    )
-
-    # Exclude the newest row because the latest Deriv candle may still be forming.
-    closed = df.iloc[:-1].copy()
-
-    if len(closed) < 50:
-        return neutral_result
-
-    last = closed.iloc[-1]
-
-    close = float(last["close"])
-    atr = float(last["atr"])
-    rsi = float(last["rsi"])
-    candle_time = last["time"]
-
-    if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
-        return {
-            **neutral_result,
-            "candle_time": candle_time,
-        }
-
-    setup = _find_confirmed_smc_setup(closed, atr)
-    reasons = list(setup["reasons"])
-
-    if setup["direction"] is None:
-        reasons.append(
-            "Sweep, cassure de structure et impulsion ne sont pas réunis dans cet ordre."
+    for timeframe in TIMEFRAME_ORDER:
+        results[timeframe] = analyze_timeframe(
+            symbol, timeframe
         )
 
-        return {
-            **neutral_result,
-            "reasons": reasons,
-            "candle_time": candle_time,
-            "rsi": rsi,
-            "atr": atr,
-        }
-
-    direction = setup["direction"]
-
-    # Higher-timeframe context is a filter, not a point added to a loose score.
-    h4 = multi_results.get("H4", {}) if isinstance(multi_results, dict) else {}
-    d1 = multi_results.get("D1", {}) if isinstance(multi_results, dict) else {}
-
-    h4_bias = h4.get("bias") if h4.get("status") == "OK" else None
-    d1_bias = d1.get("bias") if d1.get("status") == "OK" else None
-
-    higher_biases = [
-        b for b in (h4_bias, d1_bias)
-        if b in ("Haussier", "Baissier")
+    valid = [
+        result for result in results.values()
+        if result.get("ok")
     ]
 
-    if len(higher_biases) == 2 and higher_biases[0] != higher_biases[1]:
-        reasons.append("H4 et D1 sont contradictoires : signal bloqué.")
-
+    if not valid:
         return {
-            **neutral_result,
-            "reasons": reasons,
-            "candle_time": candle_time,
-            "rsi": rsi,
-            "atr": atr,
-            "bias": direction,
+            "ok": False,
+            "message": "Aucune unité de temps exploitable.",
+            "timeframes": results,
         }
 
-    if higher_biases and any(b != direction for b in higher_biases):
-        reasons.append(
-            "Le setup contredit le biais H4/D1 : confirmation insuffisante."
-        )
+    buys = sum(
+        result["direction"] == "Achat"
+        for result in valid
+    )
 
-        return {
-            **neutral_result,
-            "reasons": reasons,
-            "candle_time": candle_time,
-            "rsi": rsi,
-            "atr": atr,
-            "bias": direction,
-        }
+    sells = sum(
+        result["direction"] == "Vente"
+        for result in valid
+    )
 
-    if not higher_biases:
-        reasons.append(
-            "Biais H4/D1 indisponible : confirmation supérieure absente."
-        )
+    total = len(valid)
 
-        return {
-            **neutral_result,
-            "reasons": reasons,
-            "candle_time": candle_time,
-            "rsi": rsi,
-            "atr": atr,
-            "bias": direction,
-        }
-
-    # Momentum should not be severely against the proposed direction.
-    if direction == "Haussier":
-        if float(last["ema_20"]) <= float(last["ema_50"]) or rsi < 50:
-            reasons.append(
-                "Le momentum local ne confirme pas suffisamment l'achat."
-            )
-
-            return {
-                **neutral_result,
-                "reasons": reasons,
-                "candle_time": candle_time,
-                "rsi": rsi,
-                "atr": atr,
-                "bias": direction,
-            }
-
-        signal = "ACHAT"
-        bullish_score, bearish_score = 1, 0
-
-        stop_loss = float(setup["sweep_extreme"]) - 0.2 * atr
-        risk_distance = close - stop_loss
-
-        if risk_distance <= 0 or risk_distance > 2.5 * atr:
-            reasons.append(
-                "Stop structurel trop proche ou trop éloigné : setup rejeté."
-            )
-
-            return {
-                **neutral_result,
-                "reasons": reasons,
-                "candle_time": candle_time,
-                "rsi": rsi,
-                "atr": atr,
-                "bias": direction,
-            }
-
-        take_profit = close + 2.0 * risk_distance
-
+    if buys > sells:
+        consensus = "Achat"
+        agreement = buys / total * 100
+    elif sells > buys:
+        consensus = "Vente"
+        agreement = sells / total * 100
     else:
-        if float(last["ema_20"]) >= float(last["ema_50"]) or rsi > 50:
-            reasons.append(
-                "Le momentum local ne confirme pas suffisamment la vente."
-            )
-
-            return {
-                **neutral_result,
-                "reasons": reasons,
-                "candle_time": candle_time,
-                "rsi": rsi,
-                "atr": atr,
-                "bias": direction,
-            }
-
-        signal = "VENTE"
-        bullish_score, bearish_score = 0, 1
-
-        stop_loss = float(setup["sweep_extreme"]) + 0.2 * atr
-        risk_distance = stop_loss - close
-
-        if risk_distance <= 0 or risk_distance > 2.5 * atr:
-            reasons.append(
-                "Stop structurel trop proche ou trop éloigné : setup rejeté."
-            )
-
-            return {
-                **neutral_result,
-                "reasons": reasons,
-                "candle_time": candle_time,
-                "rsi": rsi,
-                "atr": atr,
-                "bias": direction,
-            }
-
-        take_profit = close - 2.0 * risk_distance
-
-    reasons.extend([
-        f"Biais supérieur aligné : H4={h4_bias}, D1={d1_bias}.",
-        "EMA 20/50 et RSI confirment le momentum local.",
-        "Stop basé sur l'extrême du sweep avec marge ATR.",
-        "Objectif théorique fixé à 2R avant coûts d'exécution.",
-    ])
-
-    # This is a rule-based quality score, not a win probability.
-    quality = 80
-
-    if (
-        direction == "Haussier"
-        and last["macd"] > last["macd_signal"]
-    ) or (
-        direction == "Baissier"
-        and last["macd"] < last["macd_signal"]
-    ):
-        quality += 10
-    else:
-        quality -= 10
-
-    quality = max(0, min(100, quality))
+        consensus = "Attendre"
+        agreement = 50.0
 
     return {
-        "signal": signal,
-        "confidence": quality,
-        "setup_quality": quality,
-        "confirmation": "Confirmée selon les règles ForexScope",
-        "bias": direction,
-        "entry": close,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "risk_reward": 2.0,
-        "bullish_score": bullish_score,
-        "bearish_score": bearish_score,
-        "reasons": reasons,
-        "rsi": rsi,
-        "atr": atr,
-        "candle_time": candle_time,
+        "ok": True,
+        "timeframes": results,
+        "consensus": consensus,
+        "agreement": round(agreement, 1),
+        "valid_timeframes": total,
     }
 
 
-# =========================================================
-# 5. PERMANENT SIGNAL HISTORY (SQLite)
-# =========================================================
+# ============================================================
+# GENERATION DU SIGNAL ET NIVEAUX DE RISQUE
+# ============================================================
+
+def generate_trading_signal(symbol, timeframe):
+    analysis = analyze_timeframe(symbol, timeframe)
+
+    if not analysis.get("ok"):
+        return {
+            "ok": False,
+            "signal": "Attendre",
+            "message": analysis.get(
+                "message", "Analyse indisponible."
+            ),
+        }
+
+    df = analysis["data"]
+    last = df.iloc[-1]
+
+    direction = analysis["direction"]
+    rsi = analysis["rsi"]
+    atr = analysis["atr"]
+    price = analysis["close"]
+
+    if not np.isfinite(atr) or atr <= 0:
+        return {
+            "ok": False,
+            "signal": "Attendre",
+            "message": "ATR indisponible : niveaux de risque non calculables.",
+        }
+
+    # Vérification de la dynamique et des conditions RSI.
+    if direction == "Achat":
+        valid_rsi = 45 <= rsi <= 70
+        valid_macd = last["macd"] >= last["macd_signal"]
+
+    elif direction == "Vente":
+        valid_rsi = 30 <= rsi <= 55
+        valid_macd = last["macd"] <= last["macd_signal"]
+
+    else:
+        valid_rsi = False
+        valid_macd = False
+
+    structure = analyze_market_structure(df)
+    sweep = structure.get("sweep")
+
+    # Score indicatif, pas une probabilité statistique.
+    score = 0
+    score += 30 if direction != "Neutre" else 0
+    score += 20 if valid_rsi else 0
+    score += 20 if valid_macd else 0
+    score += 20 if (
+        (direction == "Achat" and sweep == "Bullish liquidity sweep")
+        or (
+            direction == "Vente"
+            and sweep == "Bearish liquidity sweep"
+        )
+    ) else 0
+    score += 10 if structure["structure"].startswith("Cassure") else 0
+
+    if (
+        direction == "Neutre"
+        or not valid_rsi
+        or not valid_macd
+        or score < 50
+    ):
+        signal = "Attendre"
+    else:
+        signal = direction
+
+    entry = price
+
+    if signal == "Achat":
+        stop_loss = entry - 1.5 * atr
+        take_profit = entry + 3.0 * atr
+    elif signal == "Vente":
+        stop_loss = entry + 1.5 * atr
+        take_profit = entry - 3.0 * atr
+    else:
+        stop_loss = None
+        take_profit = None
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "signal": signal,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "rsi": rsi,
+        "atr": atr,
+        "score": score,
+        "trend": analysis["trend"],
+        "structure": analysis["structure"],
+        "liquidity": analysis["liquidity"],
+        "sweep": sweep,
+        "close_time": str(last["time"]),
+        "message": (
+            "Signal indicatif basé sur les données et indicateurs disponibles."
+        ),
+    }
+
+
+# ============================================================
+# HISTORIQUE SQLITE
+# ============================================================
+
 def init_signal_db():
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at_utc TEXT NOT NULL,
-                candle_time_utc TEXT,
-                market TEXT,
-                symbol TEXT,
-                timeframe TEXT,
-                signal TEXT,
-                confidence INTEGER,
+                created_at TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                signal TEXT NOT NULL,
                 entry REAL,
                 stop_loss REAL,
                 take_profit REAL,
-                reasons TEXT
+                score REAL,
+                rsi REAL
             )
-            """
-        )
+        """)
         conn.commit()
 
 
-def save_signal_record(market, symbol, timeframe, result):
-    created_at_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    candle_time = result.get("candle_time")
-
-    if candle_time is not None:
-        candle_time = pd.to_datetime(
-            candle_time,
-            utc=True,
-            errors="coerce",
-        )
-        candle_time = (
-            candle_time.isoformat()
-            if pd.notna(candle_time)
-            else None
-        )
-
-    reasons = "\n".join(result.get("reasons", []))
+def save_signal_record(result):
+    if not result or not result.get("ok"):
+        return
 
     with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            """
+        conn.execute("""
             INSERT INTO signals (
-                created_at_utc, candle_time_utc, market, symbol, timeframe,
-                signal, confidence, entry, stop_loss, take_profit, reasons
+                created_at, symbol, timeframe, signal,
+                entry, stop_loss, take_profit, score, rsi
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                created_at_utc,
-                candle_time,
-                market,
-                symbol,
-                timeframe,
-                result.get("signal"),
-                result.get("setup_quality", result.get("confidence")),
-                result.get("entry"),
-                result.get("stop_loss"),
-                result.get("take_profit"),
-                reasons,
-            ),
-        )
-
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.now(timezone.utc).isoformat(),
+            result["symbol"],
+            result["timeframe"],
+            result["signal"],
+            result.get("entry"),
+            result.get("stop_loss"),
+            result.get("take_profit"),
+            result.get("score"),
+            result.get("rsi"),
+        ))
         conn.commit()
-        return cursor.lastrowid, created_at_utc
 
 
 def get_signal_history(limit=100):
+    init_signal_db()
+
     with sqlite3.connect(DB_PATH) as conn:
         return pd.read_sql_query(
             """
-            SELECT
-                id AS ID,
-                created_at_utc AS "Créé à (UTC)",
-                candle_time_utc AS "Bougie analysée (UTC)",
-                market AS Marché,
-                symbol AS Symbole,
-                timeframe AS Unité,
-                signal AS Signal,
-                confidence AS "Score enregistré (/100)",
-                entry AS Entrée,
-                stop_loss AS "Stop Loss",
-                take_profit AS "Take Profit",
-                reasons AS Raisons
+            SELECT created_at, symbol, timeframe, signal,
+                   entry, stop_loss, take_profit, score, rsi
             FROM signals
             ORDER BY id DESC
             LIMIT ?
             """,
             conn,
             params=(int(limit),),
-        )
-
+    )
+    
+# ============================================================
+# TABLEAU DE BORD STREAMLIT
+# ============================================================
 
 init_signal_db()
-            
-# =========================================================
-# 6. DISPLAY HELPERS
-# =========================================================
-def format_price(price):
-    if price is None or pd.isna(price):
-        return "—"
 
-    price = float(price)
+st.title("ForexScope")
+st.caption(
+    "Analyse technique et structurelle — source : Yahoo Finance"
+)
 
-    if abs(price) >= 1000:
-        return f"{price:,.2f}"
-
-    if abs(price) >= 10:
-        return f"{price:.3f}"
-
-    return f"{price:.5f}"
-
-
-def build_candlestick_chart(data, market_name, timeframe):
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Candlestick(
-            x=data["time"],
-            open=data["open"],
-            high=data["high"],
-            low=data["low"],
-            close=data["close"],
-            name=market_name,
-            increasing_line_color="#16a34a",
-            decreasing_line_color="#dc2626",
-        )
-    )
-
-    fig.update_layout(
-        title=f"{market_name} — {timeframe}",
-        xaxis_title="Date et heure (UTC)",
-        yaxis_title="Prix",
-        template="plotly_dark",
-        height=550,
-        margin=dict(l=20, r=20, t=60, b=20),
-        xaxis_rangeslider_visible=False,
-        hovermode="x unified",
-        legend=dict(orientation="h"),
-    )
-
-    return fig
-
-
-def display_local_time(value):
-    if value is None or pd.isna(value):
-        return "Indisponible"
-
-    parsed = pd.to_datetime(value, utc=True, errors="coerce")
-
-    if pd.isna(parsed):
-        return "Indisponible"
-
-    return parsed.tz_convert("Africa/Kinshasa").strftime(
-        "%d/%m/%Y %H:%M:%S"
-    )
-
-
-# =========================================================
-# 7. SIDEBAR
-# =========================================================
 with st.sidebar:
-    st.title("ForexScope")
-    st.caption("Analyse des marchés financiers")
-    st.divider()
+    st.header("Paramètres")
 
     market_name = st.selectbox(
         "Marché",
-        options=list(SYMBOLS.keys()),
+        list(SYMBOLS.keys()),
         index=0,
     )
 
     timeframe = st.selectbox(
         "Unité de temps",
-        options=list(INTERVALS.keys()),
+        list(TIMEFRAMES.keys()),
         index=2,
     )
 
     candle_count = st.slider(
         "Nombre de bougies",
-        min_value=50,
-        max_value=1000,
+        min_value=100,
+        max_value=500,
         value=300,
         step=50,
     )
 
-    if st.button(
-        "Actualiser les données",
-        use_container_width=True,
-    ):
-        st.cache_data.clear()
+    st.caption(f"Symbole Yahoo : {SYMBOLS[market_name]}")
+    st.caption("Les données peuvent différer des cotations de ton broker.")
+
+    if st.button("Actualiser les données", use_container_width=True):
+        fetch_candles.clear()
         st.rerun()
 
-    st.divider()
 
-    st.caption(
-        "Source unique : Deriv WebSocket. Aucune source de secours."
-    )
+symbol = SYMBOLS[market_name]
 
+status = get_connection_status(symbol)
 
-# =========================================================
-# 8. MAIN DASHBOARD
-# =========================================================
-st.title("ForexScope")
-st.caption(
-    "Plateforme d'analyse technique et de suivi des marchés."
-)
-
-tab_market, tab_analysis, tab_history, tab_settings = st.tabs(
-    ["📈 Marché", "🎯 Analyse", "📋 Historique", "⚙️ Paramètres"]
-)
-
-with st.spinner(f"Chargement des données Deriv : {market_name}..."):
-    candles = fetch_candles(
-        SYMBOLS[market_name],
-        timeframe,
-        candle_count,
-    )
-
-    connection_status = get_connection_status(
-        SYMBOLS[market_name]
-    )
-
-if connection_status["ok"]:
-    st.success(connection_status["message"])
+if status["ok"]:
+    st.success(status["message"])
 else:
-    st.error(connection_status["message"])
+    st.warning(status["message"])
+
+tab_analysis, tab_multi, tab_history, tab_settings = st.tabs([
+    "Analyse",
+    "Multi-unités de temps",
+    "Historique",
+    "Informations",
+])
 
 
-with tab_market:
-    if candles.empty:
-        st.error(
-            "Aucune bougie reçue. Vérifie la connexion Internet, "
-            "le symbole et l'intervalle choisi."
-        )
-
-        st.info(
-            "Aucune donnée Deriv reçue. Vérifie le symbole, "
-            "l’intervalle et la connexion."
-        )
-
-    else:
-        latest = candles.iloc[-1]
-
-        previous_close = (
-            candles.iloc[-2]["close"]
-            if len(candles) >= 2
-            else latest["close"]
-        )
-
-        change = latest["close"] - previous_close
-
-        change_pct = (
-            change / previous_close * 100
-            if previous_close != 0
-            else 0
-        )
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        col1.metric("Marché", market_name)
-        col2.metric("Dernier prix", format_price(latest["close"]))
-
-        col3.metric(
-            "Variation de la dernière bougie",
-            format_price(change),
-            f"{change_pct:.3f}%",
-        )
-
-        col4.metric(
-            "Bougies disponibles",
-            f"{len(candles)}",
-        )
-
-        st.plotly_chart(
-            build_candlestick_chart(
-                candles,
-                market_name,
-                timeframe,
-            ),
-            use_container_width=True,
-        )
-
-        with st.expander("Consulter les données OHLC"):
-            st.dataframe(
-                candles.sort_values(
-                    "time",
-                    ascending=False,
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-
+# ============================================================
+# ONGLET ANALYSE
+# ============================================================
 
 with tab_analysis:
-    st.subheader("Analyse technique")
+    st.subheader(f"{market_name} — {timeframe}")
 
-    st.caption(
-        "Les signaux exigent un sweep, une cassure de structure et une impulsion, "
-        "puis un alignement H4/D1. La qualité du setup n’est pas une probabilité de gain."
-    )
+    candles = fetch_candles(symbol, timeframe, candle_count)
 
     if candles.empty:
-        st.warning(
-            "Les données du marché sélectionné sont indisponibles. "
-            "Impossible de produire une analyse fiable."
+        st.error(
+            "Aucune bougie disponible. Vérifie le symbole, "
+            "l'intervalle et la disponibilité de Yahoo Finance."
         )
-
     else:
-        current_analysis = analyze_timeframe(candles)
+        df = add_indicators(candles)
 
-        st.markdown("### Synthèse du marché sélectionné")
-        st.write(f"**Marché :** {market_name}")
-        st.write(f"**Unité de temps :** {timeframe}")
-
-        if current_analysis["status"] != "OK":
-            st.warning(current_analysis["status"])
-
+        if df.empty:
+            st.error("Les indicateurs n'ont pas pu être calculés.")
         else:
-            a, b, c = st.columns(3)
+            last = df.iloc[-1]
 
-            a.metric(
-                "Biais technique",
-                current_analysis["bias"],
+            col1, col2, col3, col4 = st.columns(4)
+
+            col1.metric(
+                "Dernière clôture",
+                f"{last['close']:.5f}",
             )
 
-            b.metric(
+            col2.metric(
                 "RSI (14)",
-                f"{current_analysis['rsi']:.2f}",
+                f"{last['rsi']:.2f}"
+                if pd.notna(last["rsi"]) else "N/D",
             )
 
-            adx_value = current_analysis["adx"]
-
-            c.metric(
-                "ADX (14)",
-                f"{adx_value:.2f}"
-                if adx_value is not None
-                else "Indisponible",
+            col3.metric(
+                "EMA 20",
+                f"{last['ema20']:.5f}"
+                if pd.notna(last["ema20"]) else "N/D",
             )
 
-            d, e, f = st.columns(3)
-
-            d.metric(
-                "Dernière clôture analysée",
-                format_price(current_analysis["close"]),
+            col4.metric(
+                "ATR (14)",
+                f"{last['atr']:.5f}"
+                if pd.notna(last["atr"]) else "N/D",
             )
 
-            e.metric(
-                "MACD",
-                current_analysis["macd"],
+            fig = go.Figure()
+
+            fig.add_trace(go.Candlestick(
+                x=df["time"],
+                open=df["open"],
+                high=df["high"],
+                low=df["low"],
+                close=df["close"],
+                name="Bougies",
+            ))
+
+            fig.add_trace(go.Scatter(
+                x=df["time"],
+                y=df["ema20"],
+                mode="lines",
+                name="EMA 20",
+            ))
+
+            fig.add_trace(go.Scatter(
+                x=df["time"],
+                y=df["ema50"],
+                mode="lines",
+                name="EMA 50",
+            ))
+
+            fig.update_layout(
+                height=550,
+                xaxis_rangeslider_visible=False,
+                template="plotly_dark",
+                margin=dict(l=10, r=10, t=30, b=10),
             )
 
-            f.metric(
-                "Structure du marché",
-                current_analysis["structure"],
+            st.plotly_chart(fig, use_container_width=True)
+
+            signal_result = generate_trading_signal(
+                symbol, timeframe
             )
 
-            st.write(
-                "**Balayage de liquidité :** "
-                + current_analysis["sweep"]
+            st.subheader("Signal de trading")
+
+            if not signal_result.get("ok"):
+                st.warning(signal_result.get(
+                    "message", "Signal indisponible."
+                ))
+            else:
+                result = signal_result
+
+                col1, col2, col3 = st.columns(3)
+
+                col1.metric("Décision", result["signal"])
+                col2.metric("Score technique", f'{result["score"]}/100')
+                col3.metric("RSI", f'{result["rsi"]:.2f}')
+
+                st.write(f"**Tendance :** {result['trend']}")
+                st.write(f"**Structure :** {result['structure']}")
+                st.write(f"**Liquidité :** {result['liquidity']}")
+                st.write(f"**Sweep détecté :** {result['sweep'] or 'Aucun'}")
+
+                if result["signal"] in ("Achat", "Vente"):
+                    c1, c2, c3 = st.columns(3)
+
+                    c1.metric("Entrée indicative", f'{result["entry"]:.5f}')
+                    c2.metric("Stop Loss", f'{result["stop_loss"]:.5f}')
+                    c3.metric("Take Profit", f'{result["take_profit"]:.5f}')
+
+                    if st.button("Enregistrer ce signal"):
+                        save_signal_record(result)
+                        st.success("Signal enregistré dans l'historique.")
+                else:
+                    st.info(
+                        "Les conditions ne sont pas suffisamment réunies. "
+                        "Aucune entrée n'est proposée."
+                    )
+
+                st.caption(result["message"])
+
+
+# ============================================================
+# ONGLET MULTI-UNITES DE TEMPS
+# ============================================================
+
+with tab_multi:
+    st.subheader("Analyse multi-unités de temps")
+
+    if st.button("Lancer l'analyse multi-unités"):
+        with st.spinner("Analyse des unités de temps..."):
+            multi = multi_timeframe_analysis(symbol)
+
+        if not multi.get("ok"):
+            st.warning(multi["message"])
+        else:
+            st.metric("Consensus indicatif", multi["consensus"])
+            st.metric(
+                "Accord entre unités",
+                f'{multi["agreement"]:.1f} %',
             )
-
-            st.write(
-                "**ATR (14) :** "
-                + format_price(current_analysis["atr"])
-            )
-
-        st.divider()
-        st.markdown("### Analyse multi-unités de temps")
-
-        if st.button(
-            "Lancer l'analyse multi-unités",
-            key="run_multi_analysis",
-            use_container_width=True,
-        ):
-            with st.spinner(
-                "Récupération et analyse des différentes unités..."
-            ):
-                multi_results = analyze_multiple_timeframes(
-                    SYMBOLS[market_name],
-                    candle_count,
-                )
 
             rows = []
 
-            for tf, result in multi_results.items():
-                rows.append({
-                    "Unité": tf,
-                    "État": result.get("status", "Inconnu"),
-                    "Biais": result.get("bias", "Neutre"),
-                    "RSI": (
-                        round(result["rsi"], 2)
-                        if result.get("rsi") is not None
-                        else None
-                    ),
-                    "ADX": (
-                        round(result["adx"], 2)
-                        if result.get("adx") is not None
-                        else None
-                    ),
-                    "MACD": result.get("macd", "Indisponible"),
-                    "Structure": result.get(
-                        "structure",
-                        "Indisponible",
-                    ),
-                    "Liquidité": result.get(
-                        "sweep",
-                        "Indisponible",
-                    ),
-                })
+            for tf, item in multi["timeframes"].items():
+                if item.get("ok"):
+                    rows.append({
+                        "Unité": tf,
+                        "Direction": item["direction"],
+                        "Tendance": item["trend"],
+                        "RSI": round(item["rsi"], 2),
+                        "Structure": item["structure"],
+                        "Sweep": item["sweep"] or "Aucun",
+                    })
+                else:
+                    rows.append({
+                        "Unité": tf,
+                        "Direction": "N/D",
+                        "Tendance": "N/D",
+                        "RSI": "N/D",
+                        "Structure": item["message"],
+                        "Sweep": "N/D",
+                    })
 
             st.dataframe(
                 pd.DataFrame(rows),
@@ -1358,200 +848,62 @@ with tab_analysis:
                 hide_index=True,
             )
 
-            valid_results = [
-                result
-                for result in multi_results.values()
-                if result.get("status") == "OK"
-            ]
-
-            if valid_results:
-                bullish = sum(
-                    r["bias"] == "Haussier"
-                    for r in valid_results
-                )
-
-                bearish = sum(
-                    r["bias"] == "Baissier"
-                    for r in valid_results
-                )
-
-                neutral = sum(
-                    r["bias"] == "Neutre"
-                    for r in valid_results
-                )
-
-                st.markdown("### Répartition des biais")
-
-                x, y, z = st.columns(3)
-
-                x.metric("Unités haussières", bullish)
-                y.metric("Unités baissières", bearish)
-                z.metric("Unités neutres", neutral)
-
-                if bullish > bearish:
-                    st.info(
-                        "Les biais haussiers sont majoritaires "
-                        "parmi les unités disponibles."
-                    )
-
-                elif bearish > bullish:
-                    st.info(
-                        "Les biais baissiers sont majoritaires "
-                        "parmi les unités disponibles."
-                    )
-
-                else:
-                    st.info(
-                        "Les biais haussiers et baissiers sont "
-                        "à égalité parmi les unités disponibles."
-                    )
-
-            else:
-                st.warning(
-                    "Aucune unité de temps n'a fourni assez de "
-                    "données valides pour une analyse."
-                )
-
-            st.divider()
-            st.markdown("### Signal ForexScope")
-
-            signal_result = generate_trading_signal(
-                candles,
-                multi_results,
-            )
-
-            signal_id, created_at_utc = save_signal_record(
-                market=market_name,
-                symbol=SYMBOLS[market_name],
-                timeframe=timeframe,
-                result=signal_result,
-            )
-
             st.caption(
-                f"Signal enregistré n°{signal_id} — créé le "
-                f"{display_local_time(created_at_utc)} "
-                "(heure de Kinshasa)"
+                "L'accord entre unités mesure leur orientation commune ; "
+                "ce n'est pas une probabilité de réussite."
             )
 
-            s1, s2, s3 = st.columns(3)
 
-            s1.metric(
-                "Décision",
-                signal_result["signal"],
-            )
-
-            s2.metric(
-                "Qualité du setup",
-                f"{signal_result.get('setup_quality', signal_result['confidence'])} / 100",
-            )
-
-            rr = signal_result["risk_reward"]
-
-            s3.metric(
-                "Ratio risque/rendement",
-                f"1:{rr:.1f}" if rr is not None else "Non défini",
-            )
-
-            if signal_result["signal"] == "ACHAT":
-                st.success(
-                    "Biais haussier détecté. Vérifie le contexte avant toute entrée."
-                )
-
-            elif signal_result["signal"] == "VENTE":
-                st.error(
-                    "Biais baissier détecté. Vérifie le contexte avant toute entrée."
-                )
-
-            else:
-                st.warning(
-                    "Pas de confluence suffisante : aucune entrée proposée."
-                )
-
-            if signal_result["signal"] in ("ACHAT", "VENTE"):
-                p1, p2, p3 = st.columns(3)
-
-                p1.metric(
-                    "Entrée indicative",
-                    format_price(signal_result["entry"]),
-                )
-
-                p2.metric(
-                    "Stop Loss",
-                    format_price(signal_result["stop_loss"]),
-                )
-
-                p3.metric(
-                    "Take Profit",
-                    format_price(signal_result["take_profit"]),
-                )
-
-            else:
-                st.info(
-                    "Aucun niveau d'entrée, de SL ou de TP n'est proposé "
-                    "tant que le signal reste ATTENDRE."
-                )
-
-            with st.expander("Pourquoi ce résultat ?"):
-                for reason in signal_result["reasons"]:
-                    st.write(f"- {reason}")
-
+# ============================================================
+# ONGLET HISTORIQUE
+# ============================================================
 
 with tab_history:
-    st.subheader("Historique des signaux")
+    st.subheader("Historique des signaux enregistrés")
 
-    history = get_signal_history(limit=100)
+    history = get_signal_history()
 
     if history.empty:
         st.info("Aucun signal enregistré pour le moment.")
-
     else:
-        history["Créé à"] = history["Créé à (UTC)"].apply(
-            display_local_time
-        )
-
-        history["Bougie analysée"] = history[
-            "Bougie analysée (UTC)"
-        ].apply(display_local_time)
-
-        history = history.drop(
-            columns=[
-                "Créé à (UTC)",
-                "Bougie analysée (UTC)",
-            ]
-        )
-
         st.dataframe(
             history,
             use_container_width=True,
             hide_index=True,
         )
 
+        csv_data = history.to_csv(index=False).encode("utf-8")
+
         st.download_button(
-            label="Télécharger l'historique CSV",
-            data=history.to_csv(index=False).encode("utf-8"),
+            "Télécharger l'historique CSV",
+            data=csv_data,
             file_name="forexscope_historique.csv",
             mime="text/csv",
         )
 
 
-with tab_settings:
-    st.subheader("Paramètres de données")
+# ============================================================
+# ONGLET INFORMATIONS
+# ============================================================
 
-    st.write("Fournisseur : Deriv WebSocket (données publiques)")
-    st.write(f"Symbole Deriv : {SYMBOLS[market_name]}")
-    st.write(f"Unité sélectionnée : {timeframe}")
-    st.write(f"Nombre de bougies demandé : {candle_count}")
+with tab_settings:
+    st.subheader("Source et limites des données")
+
+    st.write("**Fournisseur :** Yahoo Finance")
+    st.write(f"**Symbole utilisé :** {symbol}")
+    st.write(f"**Unité sélectionnée :** {timeframe}")
+    st.write(f"**Bougies demandées :** {candle_count}")
 
     st.warning(
-        "La disponibilité dépend du symbole Deriv et des autorisations du service. "
-        "ForexScope n’utilise aucune donnée simulée ni aucun repli vers Yahoo Finance."
+        "Yahoo Finance peut fournir des données retardées, "
+        "incomplètes ou indisponibles selon le marché et l'intervalle. "
+        "Le symbole Gold utilise des contrats à terme sur l'or (GC=F), "
+        "pas nécessairement le prix spot XAU/USD de ton broker."
     )
 
-
-st.divider()
-
-st.caption(
-    "ForexScope • Page actualisée à : "
-    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    st.write(
+        "Les signaux sont des indications techniques, pas des garanties "
+        "de profit. Vérifie toujours les prix et les niveaux sur ton "
+        "broker avant toute décision."
         )
     
