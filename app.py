@@ -1173,11 +1173,11 @@ with tab_analysis:
             st.divider()
             st.markdown("### Signal ForexScope")
 
-            signal_result = generate_trading_signal(
+signal_result = generate_trading_signal(
                 candles,
                 multi_results,
             )
-            signal_id, created_at_utc = save_signal_record(
+signal_id, created_at_utc = save_signal_record(
     market=selected_market,
     symbol=selected_symbol,
     timeframe=selected_timeframe,
