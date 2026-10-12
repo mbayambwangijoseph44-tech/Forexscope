@@ -1174,8 +1174,7 @@ with tab_analysis:
             st.markdown("### Signal ForexScope")
 
 signal_result = generate_trading_signal(
-                candles,
-                multi_results,)
+                candles,multi_results,)
 signal_id, created_at_utc = save_signal_record(
     market=selected_market,
     symbol=selected_symbol,
