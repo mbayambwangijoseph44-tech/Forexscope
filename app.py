@@ -1175,14 +1175,12 @@ with tab_analysis:
 
 signal_result = generate_trading_signal(
                 candles,
-                multi_results,
-            )
+                multi_results,)
 signal_id, created_at_utc = save_signal_record(
     market=selected_market,
     symbol=selected_symbol,
     timeframe=selected_timeframe,
-    result=signal_result,
-)
+    result=signal_result,)
 
 created_at_local = (
     pd.to_datetime(created_at_utc, utc=True)
