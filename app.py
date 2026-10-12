@@ -1793,14 +1793,17 @@ with tab_history:
             st.rerun()
 
     history = get_signal_history(history_limit)
+    
     if not history.empty:
-    if st.button(
-        "Enregistrer la consultation des signaux affichés"
-    ):
-        mark_signals_as_viewed(
-            history["id"].tolist()
-        )
-        st.rerun()
+        if st.button(
+            "Enregistrer la consultation des signaux affichés"
+        ):
+            mark_signals_as_viewed(
+                history["id"].tolist()
+            )
+            st.rerun()
+            
+    
 
     if history.empty:
         st.info(
