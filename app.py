@@ -1351,7 +1351,33 @@ if candles.empty:
     )
 
     st.stop()
+st.subheader("Connexion Yahoo Finance")
 
+if candles.empty:
+    st.error("Aucune donnée reçue")
+else:
+    st.success("Données reçues")
+
+    last_time = pd.to_datetime(
+        candles["time"].iloc[-1],
+        utc=True
+    )
+
+    st.write(
+        "Dernière bougie reçue (heure de Kinshasa) :",
+        last_time.tz_convert(
+            "Africa/Kinshasa"
+        ).strftime("%d/%m/%Y %H:%M:%S")
+    )
+
+    st.write(
+        "Heure actuelle (Kinshasa) :",
+        datetime.now(
+            timezone.utc
+        ).astimezone(
+            __import__("zoneinfo").ZoneInfo("Africa/Kinshasa")
+        ).strftime("%d/%m/%Y %H:%M:%S")
+    )
 latest_closed = candles.iloc[-2] if len(candles) >= 2 else candles.iloc[-1]
 
 price_now = float(latest_closed["close"])
