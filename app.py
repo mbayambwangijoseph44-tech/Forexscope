@@ -1195,16 +1195,16 @@ st.caption(
     f"(heure de Kinshasa)"
 )
 
-            s1, s2, s3 = st.columns(3)
+s1, s2, s3 = st.columns(3)
 
-            s1.metric("Décision", signal_result["signal"])
-            s2.metric(
-                "Score de confluence",
+s1.metric("Décision", signal_result["signal"])
+s2.metric(
+            "Score de confluence",
                 f"{signal_result['confidence']} / 100",
             )
 
-            s3.metric(
-                "Ratio risque/rendement",
+s3.metric(
+            "Ratio risque/rendement",
                 (
                     f"1:{signal_result['risk_reward']:.1f}"
                     if signal_result["risk_reward"] is not None
