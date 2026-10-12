@@ -11,7 +11,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
+if st.button("Tester la connexion Deriv"):
+    with st.spinner("Test en cours..."):
+        st.code(test_deriv_connection())
 
 # =========================================================
 # 1. CONFIGURATION
