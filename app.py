@@ -756,7 +756,7 @@ def save_signal_record(market, symbol, timeframe, result):
 
     reasons = "\n".join(result.get("reasons", []))
 
-    with sqlite3.connect(DB_PATH) as conn:
+with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute("""
             INSERT INTO signals (
                 created_at_utc, market, symbol, timeframe,
