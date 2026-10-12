@@ -1045,6 +1045,7 @@ def init_signal_db():
             CREATE TABLE IF NOT EXISTS signal_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at_utc TEXT NOT NULL,
+                viewed_at_utc TEXT,
                 candle_time_utc TEXT,
                 market TEXT NOT NULL,
                 timeframe TEXT NOT NULL,
@@ -1145,6 +1146,32 @@ def get_signal_history(limit=100):
         """, conn, params=(int(limit),))
 
     return history
+
+def mark_signals_as_viewed(signal_ids):
+    """Enregistre la première consultation des signaux."""
+
+    if not signal_ids:
+        return
+
+    init_signal_db()
+
+    viewed_at = datetime.now(timezone.utc).isoformat()
+
+    placeholders = ",".join(
+        ["?"] * len(signal_ids)
+    )
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            f"""
+            UPDATE signal_history
+            SET viewed_at_utc = ?
+            WHERE id IN ({placeholders})
+            AND viewed_at_utc IS NULL
+            """,
+            [viewed_at] + list(signal_ids)
+        )
+        conn.commit()
 
 
 # Initialiser la base de données.
@@ -1766,6 +1793,14 @@ with tab_history:
             st.rerun()
 
     history = get_signal_history(history_limit)
+    if not history.empty:
+    if st.button(
+        "Enregistrer la consultation des signaux affichés"
+    ):
+        mark_signals_as_viewed(
+            history["id"].tolist()
+        )
+        st.rerun()
 
     if history.empty:
         st.info(
@@ -1781,6 +1816,15 @@ with tab_history:
                 utc_to_kinshasa
             )
         )
+        history_display["viewed_at_utc"] = (
+    history_display["viewed_at_utc"].apply(
+        lambda value: (
+            utc_to_kinshasa(value)
+            if pd.notna(value)
+            else "Pas encore consulté"
+        )
+    )
+        )
 
         history_display["candle_time_utc"] = (
             history_display["candle_time_utc"].apply(
@@ -1791,6 +1835,7 @@ with tab_history:
         history_display = history_display.rename(columns={
             "id": "ID",
             "created_at_utc": "Créé à (Kinshasa)",
+            "viewed_at_utc": "Vu à (Kinshasa)",
             "candle_time_utc": "Bougie (Kinshasa)",
             "market": "Marché",
             "timeframe": "Unité",
