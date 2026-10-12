@@ -1173,24 +1173,28 @@ with tab_analysis:
             st.divider()
             st.markdown("### Signal ForexScope")
 
-signal_result = generate_trading_signal(
-                candles, multi_results)
-signal_id, created_at_utc = save_signal_record(
-                market=selected_market,
-                symbol=selected_symbol,
-                timeframe=selected_timeframe,
-                result=signal_result,
+        signal_result = generate_trading_signal(
+            candles,
+            multi_results,
         )
-created_at_local = (
-    pd.to_datetime(created_at_utc, utc=True)
-    .tz_convert("Africa/Kinshasa")
-)
 
-st.caption(
-    f"Signal enregistré n°{signal_id} — créé le "
-    f"{created_at_local.strftime('%d/%m/%Y à %H:%M:%S')} "
-    f"(heure de Kinshasa)"
-)
+        signal_id, created_at_utc = save_signal_record(
+            market=selected_market,
+            symbol=selected_symbol,
+            timeframe=selected_timeframe,
+            result=signal_result,
+        )
+
+        created_at_local = (
+            pd.to_datetime(created_at_utc, utc=True)
+            .tz_convert("Africa/Kinshasa")
+        )
+
+        st.caption(
+            f"Signal enregistré n°{signal_id} — créé le "
+            f"{created_at_local.strftime('%d/%m/%Y à %H:%M:%S')} "
+            f"(heure de Kinshasa)"
+        )
 
 s1, s2, s3 = st.columns(3)
 
