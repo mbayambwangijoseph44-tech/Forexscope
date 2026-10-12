@@ -1207,18 +1207,18 @@ s3.metric(
             "Ratio risque/rendement",
                 (
                     f"1:{signal_result['risk_reward']:.1f}"
-                    if signal_result["risk_reward"] is not None
-                    else "Non défini"
+ if signal_result["risk_reward"] is not None
+else "Non défini"
                 ),
             )
 
-            if signal_result["signal"] == "ACHAT":
+ if signal_result["signal"] == "ACHAT":
                 st.success("Biais haussier détecté. Vérifie le contexte avant toute entrée.")
-            elif signal_result["signal"] == "VENTE":
+elif signal_result["signal"] == "VENTE":
                 st.error("Biais baissier détecté. Vérifie le contexte avant toute entrée.")
-            else:
-                st.warning("Pas de confluence suffisante : aucune entrée proposée.")
-            if signal_result["signal"] in ("ACHAT", "VENTE"):
+else:
+    st.warning("Pas de confluence suffisante : aucune entrée proposée.")
+if signal_result["signal"] in ("ACHAT", "VENTE"):
                 p1, p2, p3 = st.columns(3)
 
                 p1.metric(
@@ -1235,14 +1235,14 @@ s3.metric(
                     "Take Profit",
                     format_price(signal_result["take_profit"]),
                 )
-            else:
-                st.info(
-                    "Aucun niveau d'entrée, de SL ou de TP "
+else:
+    st.info(
+            "Aucun niveau d'entrée, de SL ou de TP "
                     "n'est proposé tant que le signal reste ATTENDRE."
         )
 
-            with st.expander("Pourquoi ce résultat ?"):
-                for reason in signal_result["reasons"]:
+ with st.expander("Pourquoi ce résultat ?"):
+     for reason in signal_result["reasons"]:
                     st.write(f"- {reason}")
         
 with tab_history:
@@ -1250,10 +1250,10 @@ with tab_history:
 
     history = get_signal_history(limit=100)
 
-    if history.empty:
+if history.empty:
         st.info("Aucun signal enregistré pour le moment.")
-    else:
-        history["Créé à (UTC)"] = (
+ else:
+     history["Créé à (UTC)"] = (
             pd.to_datetime(
                 history["Créé à (UTC)"],
                 utc=True
