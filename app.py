@@ -127,10 +127,9 @@ def _deriv_request(payload, timeout=15):
     ws = None
     try:
         ws = websocket.create_connection(
-            DERIV_WS_URL,
-            timeout=timeout,
-            origin="https://app.deriv.com",
-        )
+    DERIV_WS_URL,
+    timeout=timeout
+)
         ws.send(json.dumps(payload))
         deadline = time.time() + timeout
 
