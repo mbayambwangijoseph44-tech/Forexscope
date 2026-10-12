@@ -53,7 +53,23 @@ INTERVALS = {
 
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+def test_deriv_connection():
+    import websocket
+    import json
 
+    try:
+        ws = websocket.create_connection(
+            DERIV_WS_URL,
+            timeout=10
+        )
+        ws.send(json.dumps({"ping": 1}))
+        response = json.loads(ws.recv())
+        ws.close()
+
+        return f"Connexion réussie : {response}"
+
+    except Exception as e:
+        return f"Échec du test : {type(e).__name__}: {e}"
 st.markdown(
     """
     <style>
