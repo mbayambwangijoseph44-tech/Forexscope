@@ -1244,16 +1244,15 @@ else:
 with st.expander("Pourquoi ce résultat ?"):
      for reason in signal_result["reasons"]:
                     st.write(f"- {reason}")
-        
 with tab_history:
     st.subheader("Historique des signaux")
 
     history = get_signal_history(limit=100)
 
-if history.empty:
+    if history.empty:
         st.info("Aucun signal enregistré pour le moment.")
-else:
-     history["Créé à (UTC)"] = (
+    else:
+        history["Créé à (UTC)"] = (
             pd.to_datetime(
                 history["Créé à (UTC)"],
                 utc=True
@@ -1273,8 +1272,7 @@ else:
             data=history.to_csv(index=False).encode("utf-8"),
             file_name="forexscope_historique.csv",
             mime="text/csv"
-        )
-
+                             )       
 with tab_settings:
     st.subheader("Paramètres de données")
 
