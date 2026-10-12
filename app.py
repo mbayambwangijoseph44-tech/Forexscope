@@ -1177,6 +1177,23 @@ with tab_analysis:
                 candles,
                 multi_results,
             )
+            signal_id, created_at_utc = save_signal_record(
+    market=selected_market,
+    symbol=selected_symbol,
+    timeframe=selected_timeframe,
+    result=signal_result,
+)
+
+created_at_local = (
+    pd.to_datetime(created_at_utc, utc=True)
+    .tz_convert("Africa/Kinshasa")
+)
+
+st.caption(
+    f"Signal enregistré n°{signal_id} — créé le "
+    f"{created_at_local.strftime('%d/%m/%Y à %H:%M:%S')} "
+    f"(heure de Kinshasa)"
+)
 
             s1, s2, s3 = st.columns(3)
 
@@ -1229,12 +1246,34 @@ with tab_analysis:
                     st.write(f"- {reason}")
         
 with tab_history:
-    st.subheader("Historique")
+    st.subheader("Historique des signaux")
 
-    st.info(
-        "L'enregistrement des signaux et l'historique "
-        "seront ajoutés après la validation du moteur d'analyse."
-    )
+    history = get_signal_history(limit=100)
+
+    if history.empty:
+        st.info("Aucun signal enregistré pour le moment.")
+    else:
+        history["Créé à (UTC)"] = (
+            pd.to_datetime(
+                history["Créé à (UTC)"],
+                utc=True
+            )
+            .dt.tz_convert("Africa/Kinshasa")
+            .dt.strftime("%d/%m/%Y %H:%M:%S")
+        )
+
+        st.dataframe(
+            history,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.download_button(
+            label="Télécharger l'historique CSV",
+            data=history.to_csv(index=False).encode("utf-8"),
+            file_name="forexscope_historique.csv",
+            mime="text/csv"
+        )
 
 with tab_settings:
     st.subheader("Paramètres de données")
