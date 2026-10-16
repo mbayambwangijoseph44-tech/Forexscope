@@ -1,5 +1,10 @@
 import sqlite3
+import io
+import os
+import shutil
+import tempfile
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 import numpy as np
 import pandas as pd
@@ -18,7 +23,23 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DB_PATH = "forexscope.db"
+# Stockage SQLite configurable pour Render ou un environnement local.
+# Sur Render, créer un Persistent Disk monté sur /var/data, puis définir
+# FOREXSCOPE_DATA_DIR=/var/data dans les variables d’environnement.
+_default_data_dir = "/var/data" if os.path.isdir("/var/data") else os.getcwd()
+DATA_DIR = os.environ.get("FOREXSCOPE_DATA_DIR", _default_data_dir)
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "forexscope.db")
+
+# Migration prudente : si une ancienne base locale existe et que la nouvelle
+# base persistante n’existe pas encore, la copier sans écraser de données.
+_legacy_db = os.path.join(os.getcwd(), "forexscope.db")
+if not os.path.exists(DB_PATH) and os.path.abspath(_legacy_db) != os.path.abspath(DB_PATH):
+    if os.path.isfile(_legacy_db):
+        try:
+            shutil.copy2(_legacy_db, DB_PATH)
+        except OSError:
+            pass
 
 SYMBOLS = {
     "EUR/USD": "EURUSD=X",
@@ -117,7 +138,7 @@ def validate_ohlc(data):
         & (data["high"] >= data["close"])
         & (data["low"] <= data["open"])
         & (data["low"] <= data["close"])
-        & (data["close"] > 0)
+        & (data[required] > 0).all(axis=1)
     ]
 
     data = (
@@ -126,6 +147,85 @@ def validate_ohlc(data):
         .reset_index(drop=True)
     )
     return data[["time", "open", "high", "low", "close"]]
+
+
+def run_market_data_integrity_tests():
+    """Deterministic OHLC validation tests using synthetic data only."""
+    now = pd.Timestamp("2026-01-01T00:00:00Z")
+    valid = pd.DataFrame({
+        "time": [now, now + pd.Timedelta(minutes=5)],
+        "open": [1.10, 1.11], "high": [1.12, 1.13],
+        "low": [1.09, 1.10], "close": [1.11, 1.12],
+    })
+    duplicate = pd.concat([valid, valid.iloc[[1]]], ignore_index=True)
+    invalid_ohlc = pd.DataFrame({
+        "time": [now, now + pd.Timedelta(minutes=5)],
+        "open": [1.10, 1.11], "high": [1.12, 1.00],
+        "low": [1.09, 1.10], "close": [1.11, 1.12],
+    })
+    missing_column = pd.DataFrame({"time": [now], "open": [1.1], "high": [1.2], "low": [1.0]})
+    cases = [
+        ("Bougies valides conservées", valid, 2),
+        ("Horodatages dupliqués supprimés", duplicate, 2),
+        ("Bougie OHLC incohérente rejetée", invalid_ohlc, 1),
+        ("Colonnes OHLC manquantes rejetées", missing_column, 0),
+        ("Entrée vide gérée", pd.DataFrame(), 0),
+    ]
+    rows = []
+    for name, frame, expected_count in cases:
+        try:
+            result = validate_ohlc(frame)
+            actual_count = len(result)
+            ok = actual_count == expected_count
+            # All returned candles must be chronologically sorted and unique.
+            if ok and not result.empty:
+                ok = result["time"].is_monotonic_increasing and not result["time"].duplicated().any()
+            rows.append({"Test": name, "Attendu": expected_count, "Obtenu": actual_count,
+                         "État": "RÉUSSI" if ok else "ÉCHEC"})
+        except Exception as exc:
+            rows.append({"Test": name, "Attendu": expected_count,
+                         "Obtenu": f"Erreur: {type(exc).__name__}", "État": "ÉCHEC"})
+    return pd.DataFrame(rows)
+
+
+def build_candle_quality_report(data, timeframe):
+    """Inspect loaded candles without changing them or making a network request."""
+    rows = []
+    if data is None or data.empty:
+        return pd.DataFrame([{"Contrôle": "Disponibilité", "État": "INDISPONIBLE", "Détail": "Aucune bougie chargée."}])
+    frame = data.copy()
+    frame["time"] = pd.to_datetime(frame["time"], utc=True, errors="coerce")
+    required = ["time", "open", "high", "low", "close"]
+    missing_cols = [c for c in required if c not in frame.columns]
+    rows.append({"Contrôle": "Colonnes requises", "État": "OK" if not missing_cols else "ERREUR",
+                 "Détail": "Toutes présentes" if not missing_cols else ", ".join(missing_cols)})
+    if missing_cols:
+        return pd.DataFrame(rows)
+    invalid_time = int(frame["time"].isna().sum())
+    duplicate_time = int(frame["time"].duplicated().sum())
+    chronological = frame["time"].dropna().is_monotonic_increasing
+    rows.extend([
+        {"Contrôle": "Nombre de bougies", "État": "OK" if len(frame) >= 30 else "À VÉRIFIER", "Détail": str(len(frame))},
+        {"Contrôle": "Horodatages invalides", "État": "OK" if invalid_time == 0 else "ERREUR", "Détail": str(invalid_time)},
+        {"Contrôle": "Horodatages dupliqués", "État": "OK" if duplicate_time == 0 else "ERREUR", "Détail": str(duplicate_time)},
+        {"Contrôle": "Ordre chronologique", "État": "OK" if chronological else "À VÉRIFIER", "Détail": "Croissant" if chronological else "Données non triées"},
+    ])
+    numeric = frame[["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
+    bad_numeric = int(numeric.isna().any(axis=1).sum())
+    bad_ohlc = int(((numeric["high"] < numeric[["open", "close", "low"]].max(axis=1)) |
+                    (numeric["low"] > numeric[["open", "close", "high"]].min(axis=1) )).sum())
+    rows.extend([
+        {"Contrôle": "Valeurs OHLC non numériques/manquantes", "État": "OK" if bad_numeric == 0 else "ERREUR", "Détail": str(bad_numeric)},
+        {"Contrôle": "Cohérence High/Low", "État": "OK" if bad_ohlc == 0 else "ERREUR", "Détail": str(bad_ohlc)},
+    ])
+    if frame["time"].notna().any():
+        last_time = frame["time"].dropna().max()
+        age = max(0.0, (pd.Timestamp.now(tz="UTC") - last_time).total_seconds() / 60.0)
+        expected = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}.get(timeframe, 60)
+        fresh = age <= max(expected * 3, 15 if timeframe.startswith("M") else expected * 2)
+        rows.append({"Contrôle": "Fraîcheur indicative", "État": "OK" if fresh else "À VÉRIFIER",
+                     "Détail": f"Dernière bougie : {last_time.isoformat()} ; âge ≈ {age:.1f} min"})
+    return pd.DataFrame(rows)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -338,7 +438,8 @@ def _find_confirmed_smc_setup(closed, atr, lookback=20, sweep_window=6):
     empty = {"direction": None, "sweep_extreme": None, "reasons": []}
     if closed is None or len(closed) < lookback + 3:
         return empty
-        # The final candle is the potential confirmation candle. A sweep must have
+
+    # The final candle is the potential confirmation candle. A sweep must have
     # happened earlier; a sweep alone is never an entry signal.
     current = closed.iloc[-1]
     current_index = len(closed) - 1
@@ -488,6 +589,158 @@ def analyze_multiple_timeframes(symbol, count=300):
     return results
 
 
+
+def build_mtf_consistency_report(mtf_results):
+    """Create a transparent consistency report from already computed timeframe results."""
+    order = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+    rows = []
+    valid_biases = []
+    for tf in order:
+        item = (mtf_results or {}).get(tf, {})
+        status = item.get("status", "Données indisponibles")
+        bias = item.get("bias", "Neutre")
+        if status != "OK":
+            bias = "Indisponible"
+        elif bias not in ("Haussier", "Baissier", "Neutre"):
+            bias = "Neutre"
+        if bias in ("Haussier", "Baissier"):
+            valid_biases.append((tf, bias))
+        candle_time = item.get("candle_time")
+        try:
+            candle_time = pd.Timestamp(candle_time).isoformat() if candle_time is not None else "Indisponible"
+        except Exception:
+            candle_time = str(candle_time) if candle_time is not None else "Indisponible"
+        # Freshness is a diagnostic, not proof that a market should be trading now.
+        # Yahoo timestamps may be delayed and FX/crypto/equity calendars differ.
+        age_minutes = None
+        freshness = "INCONNUE"
+        raw_time = item.get("candle_time")
+        if status == "OK" and raw_time is not None:
+            try:
+                ts = pd.Timestamp(raw_time)
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                else:
+                    ts = ts.tz_convert("UTC")
+                age_minutes = max(0.0, (pd.Timestamp.now(tz="UTC") - ts).total_seconds() / 60.0)
+                expected_minutes = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}.get(tf, 60)
+                tolerance_minutes = max(expected_minutes * 3, 15 if tf.startswith("M") else expected_minutes * 2)
+                freshness = "RÉCENTE" if age_minutes <= tolerance_minutes else "POTENTIELLEMENT PÉRIMÉE"
+            except Exception:
+                freshness = "HORODATAGE INVALIDE"
+        elif status != "OK":
+            freshness = "INDISPONIBLE"
+        rows.append({
+            "Unité": tf, "État": status, "Biais": bias,
+            "RSI": round(float(item["rsi"]), 2) if item.get("rsi") is not None and np.isfinite(item["rsi"]) else None,
+            "Clôture analysée": item.get("close"), "Heure bougie": candle_time,
+            "Âge bougie (min)": round(age_minutes, 1) if age_minutes is not None else None,
+            "Fraîcheur indicative": freshness,
+        })
+
+    higher = [b for tf, b in valid_biases if tf in ("H4", "D1")]
+    execution = [b for tf, b in valid_biases if tf in ("M5", "M15")]
+    if not higher or not execution:
+        summary = "Données insuffisantes pour comparer le biais supérieur H4/D1 aux unités M5/M15."
+        state = "INCOMPLET"
+    elif len(set(higher)) == 1 and len(set(execution)) == 1 and higher[0] == execution[0]:
+        summary = f"Confluence directionnelle : H4/D1 et M5/M15 sont {higher[0].lower()}. Cela ne garantit pas un signal d’entrée."
+        state = "ALIGNÉ"
+    elif set(higher).isdisjoint(set(execution)):
+        summary = "Conflit directionnel entre H4/D1 et M5/M15. Une entrée dans le sens du biais supérieur n’est pas confirmée par les unités courtes."
+        state = "CONFLIT"
+    else:
+        summary = "Confluence partielle : certaines unités sont alignées et d’autres divergent. Vérifier le contexte avant toute décision."
+        state = "PARTIEL"
+    return pd.DataFrame(rows), state, summary
+
+def run_mtf_integrity_unit_tests():
+    """Small deterministic tests for missing, malformed and stale MTF timestamps."""
+    cases = [
+        {"name": "Unité absente", "item": {"status": "Données indisponibles", "bias": "Neutre", "candle_time": None}, "expected": "INDISPONIBLE"},
+        {"name": "Horodatage invalide", "item": {"status": "OK", "bias": "Haussier", "candle_time": "pas-une-date", "rsi": 50, "close": 1.2}, "expected": "HORODATAGE INVALIDE"},
+        {"name": "Biais inconnu", "item": {"status": "OK", "bias": "inconnu", "candle_time": pd.Timestamp.now(tz="UTC"), "rsi": 50, "close": 1.2}, "expected_bias": "Neutre"},
+    ]
+    rows = []
+    for case in cases:
+        report, _, _ = build_mtf_consistency_report({"M5": case["item"]})
+        row = report.loc[report["Unité"] == "M5"].iloc[0]
+        if "expected" in case:
+            actual = row["Fraîcheur indicative"]
+            passed = actual == case["expected"]
+            expected = case["expected"]
+        else:
+            actual = row["Biais"]
+            expected = case["expected_bias"]
+            passed = actual == expected
+        rows.append({"Test": case["name"], "Attendu": expected, "Obtenu": actual, "État": "RÉUSSI" if passed else "ÉCHEC"})
+    return pd.DataFrame(rows)
+
+
+
+def assess_mtf_readiness(mtf_results, now=None):
+    """Conservative MTF readiness gate; this is a data/consistency check, not a trade signal."""
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+    else:
+        now = now.tz_convert("UTC")
+    required = {"M5": 45, "M15": 120, "H4": 2160, "D1": 10080}
+    issues, directions = [], []
+    details = []
+    for tf, max_age in required.items():
+        item = mtf_results.get(tf, {}) if isinstance(mtf_results, dict) else {}
+        status = item.get("status", "Données indisponibles")
+        bias = item.get("bias", "Neutre")
+        age = None
+        if status != "OK":
+            issues.append(f"{tf} indisponible.")
+        else:
+            ts = pd.to_datetime(item.get("candle_time"), utc=True, errors="coerce")
+            if pd.isna(ts):
+                issues.append(f"Horodatage {tf} absent ou invalide.")
+            else:
+                age = max(0.0, (now - ts).total_seconds() / 60.0)
+                if age > max_age:
+                    issues.append(f"Données {tf} trop anciennes ({age:.0f} min; seuil {max_age} min).")
+            if bias not in ("Haussier", "Baissier"):
+                issues.append(f"Biais {tf} neutre ou non exploitable.")
+            else:
+                directions.append((tf, bias))
+        details.append({"Unité": tf, "État données": status, "Biais": bias, "Âge (min)": round(age, 1) if age is not None else None, "Seuil (min)": max_age})
+    if not issues and len({b for _, b in directions}) == 1:
+        state = "PRÊT POUR ÉVALUATION"
+        summary = "Les quatre unités requises sont disponibles, indicativement récentes et alignées. Cela ne constitue pas une recommandation d’entrée."
+    elif len({b for _, b in directions}) > 1:
+        state = "CONFLIT DIRECTIONNEL"
+        summary = "Les unités requises présentent des directions opposées. Le contrôle ne valide pas de confluence complète."
+    else:
+        state = "INCOMPLET"
+        summary = "Les données, les horodatages, la fraîcheur ou les biais ne permettent pas de valider la confluence complète."
+    return pd.DataFrame(details), state, summary, issues
+
+
+def run_mtf_readiness_tests():
+    now = pd.Timestamp("2026-01-01T12:00:00Z")
+    def pack(bias="Haussier", timestamp="2026-01-01T11:55:00Z", status="OK"):
+        return {"status": status, "bias": bias, "candle_time": timestamp}
+    base = {"M5": pack(), "M15": pack(), "H4": pack(timestamp="2026-01-01T08:00:00Z"), "D1": pack(timestamp="2026-01-01T00:00:00Z")}
+    cases = []
+    cases.append(("Confluence complète récente", base, "PRÊT POUR ÉVALUATION"))
+    missing = dict(base); missing["H4"] = pack(status="Données indisponibles")
+    cases.append(("Contexte H4 indisponible", missing, "INCOMPLET"))
+    conflict = dict(base); conflict["M15"] = pack(bias="Baissier")
+    cases.append(("Directions contradictoires", conflict, "CONFLIT DIRECTIONNEL"))
+    stale = dict(base); stale["M5"] = pack(timestamp="2026-01-01T10:00:00Z")
+    cases.append(("Bougie M5 trop ancienne", stale, "INCOMPLET"))
+    neutral = dict(base); neutral["D1"] = pack(bias="Neutre", timestamp="2026-01-01T00:00:00Z")
+    cases.append(("Biais supérieur neutre", neutral, "INCOMPLET"))
+    rows = []
+    for name, data, expected in cases:
+        _, actual, _, _ = assess_mtf_readiness(data, now=now)
+        rows.append({"Test": name, "Attendu": expected, "Obtenu": actual, "État": "RÉUSSI" if actual == expected else "ÉCHEC"})
+    return pd.DataFrame(rows)
+
 def assess_smc_zone_confluence(closed_data, direction, price, atr):
     """Assess whether price is near a directional FVG/order-block candidate.
 
@@ -518,6 +771,79 @@ def assess_smc_zone_confluence(closed_data, direction, price, atr):
         result["note"] = "Aucune FVG/zone OB candidate de même direction à moins de 0,75 ATR."
     return result
 
+
+
+def validate_signal_data_freshness(raw_data, selected_timeframe, mtf_results, now=None):
+    """Fail closed when the selected candle or required H4/D1 context is missing or stale."""
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+    else:
+        now = now.tz_convert("UTC")
+
+    limits_minutes = {
+        "M1": 15, "M5": 45, "M15": 120, "M30": 240,
+        "H1": 480, "H4": 2160, "D1": 10080,
+    }
+    issues = []
+    if raw_data is None or raw_data.empty or "time" not in raw_data.columns:
+        issues.append("Les bougies du timeframe sélectionné sont absentes ou sans horodatage.")
+    else:
+        try:
+            latest = pd.to_datetime(raw_data["time"].iloc[-1], utc=True, errors="coerce")
+            if pd.isna(latest):
+                issues.append("L’horodatage de la dernière bougie est invalide.")
+            else:
+                age_minutes = max(0.0, (now - latest).total_seconds() / 60.0)
+                limit = limits_minutes.get(selected_timeframe, 240)
+                if age_minutes > limit:
+                    issues.append(
+                        f"Dernière bougie {selected_timeframe} trop ancienne : "
+                        f"{age_minutes:.0f} min (seuil indicatif {limit} min)."
+                    )
+        except (TypeError, ValueError, IndexError):
+            issues.append("Impossible de déterminer l’âge de la dernière bougie.")
+
+    # H4 and D1 are required by the signal engine. Check availability, timestamp and age.
+    for tf, limit_minutes in (("H4", 2160), ("D1", 10080)):
+        item = mtf_results.get(tf, {}) if isinstance(mtf_results, dict) else {}
+        if item.get("status") != "OK":
+            issues.append(f"Contexte {tf} indisponible : le signal doit rester ATTENDRE.")
+            continue
+        raw_time = item.get("candle_time")
+        parsed = pd.to_datetime(raw_time, utc=True, errors="coerce")
+        if pd.isna(parsed):
+            issues.append(f"Horodatage {tf} absent ou invalide.")
+            continue
+        age_minutes = max(0.0, (now - parsed).total_seconds() / 60.0)
+        if age_minutes > limit_minutes:
+            issues.append(
+                f"Contexte {tf} trop ancien : {age_minutes:.0f} min "
+                f"(seuil indicatif {limit_minutes} min)."
+            )
+    return {"ok": not issues, "issues": issues}
+
+
+def run_signal_freshness_guard_tests():
+    """Small deterministic tests for missing, fresh and stale signal inputs."""
+    now = pd.Timestamp("2026-10-16T12:00:00Z")
+    fresh = pd.DataFrame({"time": [now - pd.Timedelta(minutes=5)]})
+    stale = pd.DataFrame({"time": [now - pd.Timedelta(hours=3)]})
+    mtf_fresh = {
+        "H4": {"status": "OK", "bias": "Haussier", "candle_time": now - pd.Timedelta(hours=4)},
+        "D1": {"status": "OK", "bias": "Haussier", "candle_time": now - pd.Timedelta(days=1)},
+    }
+    cases = [
+        ("Données fraîches", validate_signal_data_freshness(fresh, "M15", mtf_fresh, now), True),
+        ("Timeframe sélectionné périmé", validate_signal_data_freshness(stale, "M15", mtf_fresh, now), False),
+        ("Contexte H4 manquant", validate_signal_data_freshness(fresh, "M15", {**mtf_fresh, "H4": {"status": "Données indisponibles"}}, now), False),
+        ("Horodatage sélectionné absent", validate_signal_data_freshness(pd.DataFrame(), "M15", mtf_fresh, now), False),
+    ]
+    return pd.DataFrame([
+        {"Test": name, "État": "RÉUSSI" if result["ok"] == expected else "ÉCHEC",
+         "Détail": "; ".join(result["issues"]) if result["issues"] else "Données acceptées."}
+        for name, result, expected in cases
+    ])
 
 # =========================================================
 # 4. SIGNAL ENGINE
@@ -583,7 +909,7 @@ def generate_trading_signal(raw_data, multi_results):
         reasons.append("Biais H4/D1 indisponible : confirmation supérieure absente.")
         return {**neutral_result, "reasons": reasons, "candle_time": candle_time, "rsi": rsi, "atr": atr, "bias": direction}
 
-    # Momentum should not be severely against the proposed direction.
+    # Momentum filters: do not buy into bearish momentum or sell into bullish momentum.
     if direction == "Haussier":
         if float(last["ema_20"]) <= float(last["ema_50"]) or rsi < 50:
             reasons.append("Le momentum local ne confirme pas suffisamment l'achat.")
@@ -609,22 +935,39 @@ def generate_trading_signal(raw_data, multi_results):
             return {**neutral_result, "reasons": reasons, "candle_time": candle_time, "rsi": rsi, "atr": atr, "bias": direction}
         take_profit = close - 2.0 * risk_distance
 
+    
+    # Anti-chasing filter: reject entries that are already too extended from EMA20.
+    ema_distance_atr = abs(close - float(last["ema_20"])) / atr
+    if ema_distance_atr > 1.5:
+        reasons.append(f"Entrée trop éloignée de l'EMA20 ({ema_distance_atr:.2f} ATR) : risque de signal tardif, setup rejeté.")
+        return {**neutral_result, "reasons": reasons, "candle_time": candle_time, "rsi": rsi, "atr": atr, "bias": direction}
+
+    adx_value = float(last["adx"]) if pd.notna(last["adx"]) else None
+    if adx_value is not None and adx_value < 12:
+        reasons.append(f"ADX faible ({adx_value:.1f}) : marché possiblement sans impulsion, setup rejeté.")
+        return {**neutral_result, "reasons": reasons, "candle_time": candle_time, "rsi": rsi, "atr": atr, "bias": direction}
+
     zone_context = assess_smc_zone_confluence(closed, direction, close, atr)
     reasons.append(zone_context["note"])
 
     reasons.extend([
         f"Biais supérieur aligné : H4={h4_bias}, D1={d1_bias}.",
         "EMA 20/50 et RSI confirment le momentum local.",
+        f"Distance entrée–EMA20 : {ema_distance_atr:.2f} ATR.",
+        f"ADX : {adx_value:.1f} (filtre d'impulsion)." if adx_value is not None else "ADX indisponible : non utilisé pour le score.",
         "Stop basé sur l'extrême du sweep avec marge ATR.",
         "Objectif théorique fixé à 2R avant coûts d'exécution.",
     ])
-    # This is a transparent rule-based quality score, not a win probability.
-    quality = 80
-    # MACD contributes only to the transparent setup-quality score.
+    # Transparent setup-quality score; it is NOT a win probability.
+    quality = 70
     if (direction == "Haussier" and last["macd"] > last["macd_signal"]) or (direction == "Baissier" and last["macd"] < last["macd_signal"]):
         quality += 10
     else:
         quality -= 10
+    if adx_value is not None:
+        quality += 10 if adx_value >= 25 else (5 if adx_value >= 18 else -5)
+    # Penalize stretched entries even when they remain within the hard rejection limit.
+    quality -= 10 if ema_distance_atr > 1.0 else 0
     quality += zone_context["score_adjustment"]
     quality = max(0, min(100, quality))
     return {
@@ -637,6 +980,8 @@ def generate_trading_signal(raw_data, multi_results):
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "risk_reward": 2.0,
+        "ema_distance_atr": round(ema_distance_atr, 3),
+        "adx": adx_value,
         "smc_zone_context": zone_context,
         "bullish_score": bullish_score,
         "bearish_score": bearish_score,
@@ -666,12 +1011,199 @@ def init_signal_db():
                 entry REAL,
                 stop_loss REAL,
                 take_profit REAL,
-                reasons TEXT
+                reasons TEXT,
+                outcome_status TEXT NOT NULL DEFAULT 'OUVERT',
+                outcome_updated_utc TEXT,
+                actual_entry REAL,
+                actual_exit REAL,
+                realized_r REAL,
+                journal_notes TEXT,
+                execution_notes TEXT
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_startups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at_utc TEXT NOT NULL,
+                data_dir TEXT NOT NULL,
+                db_path TEXT NOT NULL,
+                app_version TEXT NOT NULL
+            )
+            """
+        )
+        # Migration sûre pour les bases SQLite déjà créées en phase précédente.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
+        if "outcome_status" not in columns:
+            conn.execute("ALTER TABLE signals ADD COLUMN outcome_status TEXT NOT NULL DEFAULT 'OUVERT'")
+        if "outcome_updated_utc" not in columns:
+            conn.execute("ALTER TABLE signals ADD COLUMN outcome_updated_utc TEXT")
+        # Phase 18: extend the journal without deleting previous signal history.
+        for column, definition in {
+            "actual_entry": "REAL",
+            "actual_exit": "REAL",
+            "realized_r": "REAL",
+            "journal_notes": "TEXT",
+            "execution_notes": "TEXT",
+        }.items():
+            if column not in columns:
+                conn.execute(f"ALTER TABLE signals ADD COLUMN {column} {definition}")
         conn.commit()
 
+
+
+def validate_signal_record_consistency(result):
+    """Validate actionable signal direction, price levels and candle timestamp before persistence."""
+    if not isinstance(result, dict):
+        return {"ok": False, "issues": ["Résultat de signal absent ou invalide."]}
+    side = result.get("signal")
+    if side not in ("ACHAT", "VENTE"):
+        return {"ok": True, "issues": []}  # ATTENDRE is intentionally not persisted.
+    issues = []
+    try:
+        entry = float(result.get("entry"))
+        sl = float(result.get("stop_loss"))
+        tp = float(result.get("take_profit"))
+        if not all(np.isfinite(x) and x > 0 for x in (entry, sl, tp)):
+            issues.append("Entrée, SL et TP doivent être des prix positifs et finis.")
+        elif side == "ACHAT" and not sl < entry < tp:
+            issues.append("Pour ACHAT, les niveaux doivent respecter SL < Entrée < TP.")
+        elif side == "VENTE" and not tp < entry < sl:
+            issues.append("Pour VENTE, les niveaux doivent respecter TP < Entrée < SL.")
+    except (TypeError, ValueError):
+        issues.append("Entrée, SL ou TP manquant ou non numérique.")
+    # Verify that the declared reward/risk ratio matches the actual price levels.
+    try:
+        entry = float(result.get("entry"))
+        sl = float(result.get("stop_loss"))
+        tp = float(result.get("take_profit"))
+        if all(np.isfinite(x) and x > 0 for x in (entry, sl, tp)) and ((side == "ACHAT" and sl < entry < tp) or (side == "VENTE" and tp < entry < sl)):
+            actual_rr = abs(tp - entry) / abs(entry - sl)
+            declared_rr = result.get("risk_reward")
+            if declared_rr is not None:
+                declared_rr = float(declared_rr)
+                if not np.isfinite(declared_rr) or declared_rr <= 0:
+                    issues.append("Ratio rendement/risque déclaré invalide.")
+                elif abs(actual_rr - declared_rr) > max(0.10, 0.10 * actual_rr):
+                    issues.append(f"Ratio rendement/risque incohérent : niveaux={actual_rr:.2f}R, déclaré={declared_rr:.2f}R.")
+    except (TypeError, ValueError, ZeroDivisionError):
+        issues.append("Impossible de vérifier le ratio rendement/risque.")
+    candle_time = result.get("candle_time")
+    parsed_time = pd.to_datetime(candle_time, utc=True, errors="coerce")
+    if candle_time is None or pd.isna(parsed_time):
+        issues.append("Horodatage de la bougie du signal absent ou invalide.")
+    return {"ok": not issues, "issues": issues}
+
+
+def calculate_broker_lot_size(risk_cash, stop_pips, pip_value_per_lot, lot_step, min_lot=0.0, max_lot=None):
+    """Calcule un volume arrondi vers le bas avec Decimal et contrôle le risque."""
+    try:
+        risk = Decimal(str(risk_cash))
+        stop = Decimal(str(stop_pips))
+        pip_value = Decimal(str(pip_value_per_lot))
+        step = Decimal(str(lot_step))
+        minimum = Decimal(str(min_lot))
+        maximum = Decimal(str(max_lot)) if max_lot is not None else None
+    except (InvalidOperation, ValueError, TypeError):
+        return {"valid": False, "reason": "Paramètres numériques invalides", "raw_lots": 0.0, "rounded_lots": 0.0, "estimated_risk": 0.0}
+
+    if risk <= 0 or stop <= 0 or pip_value <= 0 or step <= 0 or minimum < 0:
+        return {"valid": False, "reason": "Le risque, la distance SL, la valeur du pip et le pas doivent être positifs", "raw_lots": 0.0, "rounded_lots": 0.0, "estimated_risk": 0.0}
+    if maximum is not None and maximum < minimum:
+        return {"valid": False, "reason": "Le volume maximal est inférieur au volume minimal", "raw_lots": 0.0, "rounded_lots": 0.0, "estimated_risk": 0.0}
+
+    raw = risk / (stop * pip_value)
+    rounded = (raw / step).to_integral_value(rounding=ROUND_DOWN) * step
+    if maximum is not None:
+        rounded = min(rounded, (maximum / step).to_integral_value(rounding=ROUND_DOWN) * step)
+    estimated_risk = rounded * stop * pip_value
+    valid = rounded > 0 and rounded >= minimum and estimated_risk <= risk
+    reason = "OK" if valid else ("Volume arrondi inférieur au minimum autorisé" if rounded < minimum or rounded <= 0 else "Le risque calculé dépasse le budget")
+    return {
+        "valid": bool(valid), "reason": reason, "raw_lots": float(raw),
+        "rounded_lots": float(rounded), "estimated_risk": float(estimated_risk),
+        "risk_budget": float(risk), "unused_risk": float(risk - estimated_risk),
+    }
+
+
+def run_position_sizing_rounding_tests():
+    """Tests isolés du calcul de lots; aucune connexion au courtier n'est effectuée."""
+    cases = [
+        ("Pas 0,01 : arrondi vers le bas", dict(risk_cash=100, stop_pips=20, pip_value_per_lot=10, lot_step=0.01, min_lot=0.01), 0.5, True),
+        ("Le risque reste sous le budget", dict(risk_cash=95, stop_pips=25, pip_value_per_lot=10, lot_step=0.01, min_lot=0.01), 0.38, True),
+        ("Budget trop faible pour le minimum", dict(risk_cash=1, stop_pips=100, pip_value_per_lot=10, lot_step=0.01, min_lot=0.01), 0.0, False),
+        ("Pas 0,1", dict(risk_cash=250, stop_pips=25, pip_value_per_lot=10, lot_step=0.1, min_lot=0.1), 1.0, True),
+        ("Paramètre invalide rejeté", dict(risk_cash=100, stop_pips=0, pip_value_per_lot=10, lot_step=0.01), 0.0, False),
+        ("Plafond de volume respecté", dict(risk_cash=1000, stop_pips=10, pip_value_per_lot=10, lot_step=0.01, min_lot=0.01, max_lot=0.5), 0.5, True),
+        ("Pas incompatible avec le budget", dict(risk_cash=30, stop_pips=100, pip_value_per_lot=10, lot_step=0.1, min_lot=0.1), 0.0, False),
+        ("Pas décimal sans dépassement", dict(risk_cash=73, stop_pips=17, pip_value_per_lot=9.7, lot_step=0.001, min_lot=0.001), None, True),
+    ]
+    rows = []
+    for name, kwargs, expected_volume, expected_valid in cases:
+        result = calculate_broker_lot_size(**kwargs)
+        ok = result["valid"] == expected_valid
+        if expected_volume is not None:
+            ok = ok and abs(result["rounded_lots"] - expected_volume) < 1e-8
+        if result["valid"]:
+            ok = ok and result["estimated_risk"] <= kwargs["risk_cash"] + 1e-8
+            ok = ok and result["rounded_lots"] <= result["raw_lots"] + 1e-8
+        rows.append({"Test": name, "Volume théorique": round(result["raw_lots"], 6), "Volume arrondi": round(result["rounded_lots"], 6), "Risque estimé": round(result["estimated_risk"], 6), "État": "RÉUSSI" if ok else "ÉCHEC", "Détail": result["reason"]})
+    return pd.DataFrame(rows)
+
+
+def run_signal_record_consistency_tests():
+    """Deterministic checks for signal levels and timestamp before saving."""
+    valid_buy = {"signal": "ACHAT", "entry": 100.0, "stop_loss": 98.0, "take_profit": 104.0,
+                 "candle_time": "2026-10-16T10:00:00Z"}
+    valid_sell = {"signal": "VENTE", "entry": 100.0, "stop_loss": 102.0, "take_profit": 96.0,
+                  "candle_time": "2026-10-16T10:00:00Z"}
+    cases = [
+        ("ACHAT avec niveaux et ratio cohérents", valid_buy, True),
+        ("VENTE avec niveaux et ratio cohérents", valid_sell, True),
+        ("ACHAT avec SL du mauvais côté", {**valid_buy, "stop_loss": 101.0}, False),
+        ("TP manquant", {**valid_buy, "take_profit": None}, False),
+        ("Ratio R/R déclaré incohérent", {**valid_buy, "risk_reward": 1.0}, False),
+        ("Ratio R/R non positif", {**valid_buy, "risk_reward": 0}, False),
+        ("Horodatage absent", {**valid_buy, "candle_time": None}, False),
+        ("ATTENDRE non actionnable", {"signal": "ATTENDRE"}, True),
+    ]
+    rows = []
+    for name, result, expected in cases:
+        check = validate_signal_record_consistency(result)
+        passed = check["ok"] == expected
+        rows.append({"Test": name, "État": "RÉUSSI" if passed else "ÉCHEC",
+                     "Détail": "; ".join(check["issues"]) if check["issues"] else "Contrôle accepté."})
+    return pd.DataFrame(rows)
+
+
+def audit_saved_signal_consistency(limit=200):
+    """Inspect saved actionable rows for level direction and timestamp consistency."""
+    history = get_signal_history(limit=limit)
+    if history is None or history.empty:
+        return pd.DataFrame([{"ID": None, "Symbole": None, "Unité": None, "Signal": None,
+                              "État": "À VÉRIFIER", "Détail": "Aucun signal enregistré à auditer."}])
+    rows = []
+    for _, row in history.iterrows():
+        side = row.get("Signal")
+        issues = []
+        try:
+            entry, sl, tp = (float(row.get("Entrée")), float(row.get("Stop Loss")), float(row.get("Take Profit")))
+            if not all(np.isfinite(x) and x > 0 for x in (entry, sl, tp)):
+                issues.append("Prix absent, non fini ou non positif.")
+            elif side == "ACHAT" and not sl < entry < tp:
+                issues.append("Ordre SL/Entrée/TP incohérent pour ACHAT.")
+            elif side == "VENTE" and not tp < entry < sl:
+                issues.append("Ordre TP/Entrée/SL incohérent pour VENTE.")
+        except (TypeError, ValueError):
+            issues.append("Entrée, SL ou TP manquant/non numérique.")
+        stamp = pd.to_datetime(row.get("Bougie analysée (UTC)"), utc=True, errors="coerce")
+        if pd.isna(stamp):
+            issues.append("Horodatage de bougie absent/invalide.")
+        rows.append({"ID": row.get("ID"), "Symbole": row.get("Symbole"), "Unité": row.get("Unité"),
+                     "Signal": side, "État": "À CORRIGER" if issues else "COHÉRENT",
+                     "Détail": "; ".join(issues) if issues else "Niveaux et horodatage cohérents."})
+    return pd.DataFrame(rows)
 
 def save_signal_record(market, symbol, timeframe, result, cooldown_minutes=0):
     """
@@ -686,6 +1218,10 @@ def save_signal_record(market, symbol, timeframe, result, cooldown_minutes=0):
 
     if signal not in ("ACHAT", "VENTE"):
         return None, created_at_utc, "not_actionable", 0
+
+    consistency = validate_signal_record_consistency(result)
+    if not consistency["ok"]:
+        return None, created_at_utc, "invalid_levels", 0
 
     candle_time = result.get("candle_time")
     if candle_time is not None:
@@ -761,6 +1297,207 @@ def save_signal_record(market, symbol, timeframe, result, cooldown_minutes=0):
         return cursor.lastrowid, created_at_utc, "saved", 0
 
 
+def update_signal_outcome(signal_id, outcome_status):
+    """Enregistre manuellement le résultat observé d'un signal."""
+    allowed = {"OUVERT", "GAGNANT", "PERDANT", "NEUTRE"}
+    if outcome_status not in allowed:
+        raise ValueError("Statut de résultat non autorisé")
+    updated = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE signals SET outcome_status = ?, outcome_updated_utc = ? WHERE id = ?",
+            (outcome_status, updated, int(signal_id)),
+        )
+        conn.commit()
+
+
+
+def update_trade_journal(signal_id, actual_entry, actual_exit, realized_r, journal_notes, execution_notes):
+    """Save execution details and review notes for one historical signal."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """UPDATE signals
+               SET actual_entry = ?, actual_exit = ?, realized_r = ?,
+                   journal_notes = ?, execution_notes = ?
+               WHERE id = ?""",
+            (
+                actual_entry if actual_entry > 0 else None,
+                actual_exit if actual_exit > 0 else None,
+                realized_r,
+                journal_notes.strip() or None,
+                execution_notes.strip() or None,
+                int(signal_id),
+            ),
+        )
+        conn.commit()
+
+
+
+def run_signal_lifecycle_tests():
+    """Exercise save, duplicate prevention, outcome update and journal preservation in an isolated SQLite DB."""
+    global DB_PATH
+    original_db_path = DB_PATH
+    rows = []
+    with tempfile.TemporaryDirectory(prefix="forexscope_lifecycle_") as tmp_dir:
+        try:
+            DB_PATH = os.path.join(tmp_dir, "lifecycle_test.db")
+            init_signal_db()
+            sample = {
+                "signal": "ACHAT", "entry": 100.0, "stop_loss": 98.0,
+                "take_profit": 104.0, "candle_time": "2026-10-16T10:00:00Z",
+                "setup_quality": 78, "reasons": ["test déterministe"]
+            }
+            first_id, _, first_status, _ = save_signal_record(
+                "Test", "TEST=X", "M15", sample, cooldown_minutes=0
+            )
+            rows.append({"Test": "Création d’un signal valide", "État": "RÉUSSI" if first_status == "saved" and first_id else "ÉCHEC",
+                         "Détail": f"statut={first_status}, id={first_id}"})
+
+            duplicate_id, _, duplicate_status, _ = save_signal_record(
+                "Test", "TEST=X", "M15", sample, cooldown_minutes=0
+            )
+            with sqlite3.connect(DB_PATH) as conn:
+                count_after_duplicate = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+            duplicate_ok = duplicate_status == "duplicate_candle" and duplicate_id == first_id and count_after_duplicate == 1
+            rows.append({"Test": "Anti-doublon sur la même bougie", "État": "RÉUSSI" if duplicate_ok else "ÉCHEC",
+                         "Détail": f"statut={duplicate_status}, lignes={count_after_duplicate}"})
+
+            update_signal_outcome(first_id, "GAGNANT")
+            with sqlite3.connect(DB_PATH) as conn:
+                state = conn.execute("SELECT outcome_status, entry, stop_loss, take_profit FROM signals WHERE id=?", (first_id,)).fetchone()
+            outcome_ok = state is not None and state[0] == "GAGNANT" and tuple(state[1:]) == (100.0, 98.0, 104.0)
+            rows.append({"Test": "Mise à jour du résultat sans modifier les niveaux", "État": "RÉUSSI" if outcome_ok else "ÉCHEC",
+                         "Détail": f"statut={state[0] if state else None}, niveaux préservés={bool(state and tuple(state[1:]) == (100.0, 98.0, 104.0))}"})
+
+            update_trade_journal(first_id, 100.1, 103.8, 1.8, "revue test", "exécution test")
+            with sqlite3.connect(DB_PATH) as conn:
+                state = conn.execute("SELECT entry, stop_loss, take_profit, actual_entry, actual_exit, realized_r, journal_notes, execution_notes FROM signals WHERE id=?", (first_id,)).fetchone()
+            journal_ok = state is not None and tuple(state[:3]) == (100.0, 98.0, 104.0) and tuple(state[3:6]) == (100.1, 103.8, 1.8) and state[6] == "revue test" and state[7] == "exécution test"
+            rows.append({"Test": "Journal d’exécution distinct des niveaux d’origine", "État": "RÉUSSI" if journal_ok else "ÉCHEC",
+                         "Détail": "Les prix du signal restent distincts des prix réellement exécutés." if journal_ok else "Les données du journal ou les niveaux ne correspondent pas."})
+
+            invalid = {**sample, "candle_time": "2026-10-16T10:15:00Z", "stop_loss": 101.0}
+            invalid_id, _, invalid_status, _ = save_signal_record("Test", "TEST=X", "M15", invalid, cooldown_minutes=0)
+            with sqlite3.connect(DB_PATH) as conn:
+                final_count = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+            invalid_ok = invalid_id is None and invalid_status == "invalid_levels" and final_count == 1
+            rows.append({"Test": "Refus d’un signal incohérent", "État": "RÉUSSI" if invalid_ok else "ÉCHEC",
+                         "Détail": f"statut={invalid_status}, lignes finales={final_count}"})
+        except Exception as exc:
+            rows.append({"Test": "Exécution du cycle de vie", "État": "ÉCHEC", "Détail": f"{type(exc).__name__}: {exc}"})
+        finally:
+            DB_PATH = original_db_path
+    return pd.DataFrame(rows)
+
+
+def run_storage_integrity_tests():
+    """Test SQLite backup/restore round-trip in temporary files, never touching the live database."""
+    rows = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="forexscope_storage_test_") as tmp_dir:
+            source_path = os.path.join(tmp_dir, "source.db")
+            backup_path = os.path.join(tmp_dir, "backup.db")
+            restored_path = os.path.join(tmp_dir, "restored.db")
+            with sqlite3.connect(source_path) as conn:
+                conn.execute("CREATE TABLE storage_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+                conn.execute("INSERT INTO storage_probe(value) VALUES (?)", ("forexscope-roundtrip",))
+                conn.commit()
+            # Use SQLite's online backup API, as the application does for user backups.
+            with sqlite3.connect(source_path) as source_conn, sqlite3.connect(backup_path) as backup_conn:
+                source_conn.backup(backup_conn)
+            with sqlite3.connect(backup_path) as check_conn:
+                integrity = check_conn.execute("PRAGMA integrity_check").fetchone()[0]
+                count = check_conn.execute("SELECT COUNT(*) FROM storage_probe").fetchone()[0]
+                value = check_conn.execute("SELECT value FROM storage_probe WHERE id=1").fetchone()[0]
+            ok = integrity == "ok" and count == 1 and value == "forexscope-roundtrip"
+            rows.append({"Test": "Sauvegarde SQLite intègre", "État": "RÉUSSI" if ok else "ÉCHEC", "Détail": f"integrity_check={integrity}; lignes={count}; contenu conforme={value == 'forexscope-roundtrip'}"})
+            # Restore the backup into a separate destination and verify its contents.
+            with sqlite3.connect(backup_path) as backup_conn, sqlite3.connect(restored_path) as restored_conn:
+                backup_conn.backup(restored_conn)
+            with sqlite3.connect(restored_path) as restored_conn:
+                restored_integrity = restored_conn.execute("PRAGMA integrity_check").fetchone()[0]
+                restored_value = restored_conn.execute("SELECT value FROM storage_probe WHERE id=1").fetchone()[0]
+            restore_ok = restored_integrity == "ok" and restored_value == "forexscope-roundtrip"
+            rows.append({"Test": "Restauration de la sauvegarde", "État": "RÉUSSI" if restore_ok else "ÉCHEC", "Détail": f"integrity_check={restored_integrity}; contenu restauré conforme={restored_value == 'forexscope-roundtrip'}"})
+            # Ensure a filesystem write is possible in the configured data directory.
+            probe_path = os.path.join(DATA_DIR, ".forexscope_write_probe.tmp")
+            try:
+                with open(probe_path, "w", encoding="utf-8") as probe:
+                    probe.write("ok")
+                writable_ok = Path(probe_path).read_text(encoding="utf-8") == "ok"
+                rows.append({"Test": "Écriture dans le répertoire configuré", "État": "RÉUSSI" if writable_ok else "ÉCHEC", "Détail": f"Répertoire={DATA_DIR}; écriture/lecture vérifiée"})
+            finally:
+                try:
+                    os.remove(probe_path)
+                except OSError:
+                    pass
+            rows.append({"Test": "Base réelle protégée pendant les tests", "État": "RÉUSSI", "Détail": "Tous les essais SQLite utilisent des fichiers temporaires distincts de la base active."})
+    except Exception as exc:
+        rows.append({"Test": "Tests de sauvegarde/restauration", "État": "ÉCHEC", "Détail": f"{type(exc).__name__}: {exc}"})
+    return pd.DataFrame(rows)
+
+def auto_check_signal_outcomes(limit=200):
+    """Classify open signals when later available candles touch SL or TP.
+
+    If both levels are touched in one candle, leave the signal open because
+    OHLC data cannot establish which level was reached first.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """SELECT id, symbol, timeframe, signal, candle_time_utc, stop_loss, take_profit
+               FROM signals WHERE outcome_status = 'OUVERT'
+                 AND signal IN ('ACHAT', 'VENTE')
+                 AND stop_loss IS NOT NULL AND take_profit IS NOT NULL
+               ORDER BY id DESC LIMIT ?""", (int(limit),)
+        ).fetchall()
+    checked = wins = losses = 0
+    for signal_id, symbol, tf, direction, candle_time, sl, tp in rows:
+        if not candle_time or tf not in INTERVALS:
+            continue
+        data = fetch_candles(symbol, tf, count=300)
+        if data is None or data.empty:
+            continue
+        signal_time = pd.to_datetime(candle_time, utc=True, errors='coerce')
+        if pd.isna(signal_time):
+            continue
+        times = pd.to_datetime(data['time'], utc=True, errors='coerce')
+        future = data.loc[times > signal_time]
+        outcome = None
+        for _, bar in future.iterrows():
+            if direction == 'ACHAT':
+                hit_sl, hit_tp = float(bar['low']) <= float(sl), float(bar['high']) >= float(tp)
+            else:
+                hit_sl, hit_tp = float(bar['high']) >= float(sl), float(bar['low']) <= float(tp)
+            if hit_sl and hit_tp:
+                outcome = None
+                break
+            if hit_tp:
+                outcome = 'GAGNANT'
+                break
+            if hit_sl:
+                outcome = 'PERDANT'
+                break
+        if outcome:
+            update_signal_outcome(signal_id, outcome)
+            checked += 1
+            wins += int(outcome == 'GAGNANT')
+            losses += int(outcome == 'PERDANT')
+    return checked, wins, losses
+
+def get_signal_outcome_summary():
+    """Résumé des résultats enregistrés, sans modifier l'historique."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT COALESCE(outcome_status, 'OUVERT'), COUNT(*) FROM signals GROUP BY COALESCE(outcome_status, 'OUVERT')"
+        ).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+        latest = conn.execute(
+            "SELECT id, symbol, timeframe, signal, outcome_status, outcome_updated_utc FROM signals ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    counts = {str(status): int(count) for status, count in rows}
+    return counts, int(total or 0), latest
+
+
 def get_signal_history(limit=100):
     with sqlite3.connect(DB_PATH) as conn:
         return pd.read_sql_query(
@@ -777,6 +1514,13 @@ def get_signal_history(limit=100):
                 entry AS Entrée,
                 stop_loss AS "Stop Loss",
                 take_profit AS "Take Profit",
+                outcome_status AS Résultat,
+                outcome_updated_utc AS "Résultat actualisé (UTC)",
+                actual_entry AS "Entrée réelle",
+                actual_exit AS "Sortie réelle",
+                realized_r AS "Résultat (R)",
+                journal_notes AS "Notes de revue",
+                execution_notes AS "Notes d'exécution",
                 reasons AS Raisons
             FROM signals
             ORDER BY id DESC
@@ -787,7 +1531,189 @@ def get_signal_history(limit=100):
         )
 
 
+def build_period_robustness_report(history: pd.DataFrame, min_closed: int = 5) -> pd.DataFrame:
+    """Summarize historical signal outcomes by calendar month without claiming predictive validity."""
+    columns = ["Période (UTC)", "Symbole", "Unité", "Signaux clôturés", "Gagnants", "Perdants",
+               "Taux de réussite (%)", "R théorique moyen", "R réel moyen", "Échantillon suffisant"]
+    if history is None or history.empty:
+        return pd.DataFrame(columns=columns)
+    required = {"Créé à (UTC)", "Marché", "Unité", "Résultat"}
+    if not required.issubset(history.columns):
+        return pd.DataFrame(columns=columns)
+    df = history.copy()
+    created = pd.to_datetime(df["Créé à (UTC)"], errors="coerce", utc=True)
+    df["_Période"] = created.dt.strftime("%Y-%m")
+    df["_Résultat"] = df["Résultat"].fillna("OUVERT").astype(str)
+    df = df[df["_Période"].notna() & df["_Résultat"].isin(["GAGNANT", "PERDANT"])]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    # Reuse the existing theoretical-R calculation, keeping it separate from manually entered realized R.
+    df["_R_th"] = df.apply(lambda row: _period_theoretical_r(row), axis=1)
+    if "Résultat (R)" in df.columns:
+        df["_R_reel"] = pd.to_numeric(df["Résultat (R)"], errors="coerce")
+    else:
+        df["_R_reel"] = float("nan")
+    rows = []
+    group_cols = ["_Période", "Marché", "Unité"]
+    for (period, market, timeframe), group in df.groupby(group_cols, dropna=False):
+        wins = int((group["_Résultat"] == "GAGNANT").sum())
+        losses = int((group["_Résultat"] == "PERDANT").sum())
+        closed = wins + losses
+        th = pd.to_numeric(group["_R_th"], errors="coerce").dropna()
+        real = pd.to_numeric(group["_R_reel"], errors="coerce").dropna()
+        rows.append({
+            "Période (UTC)": str(period), "Symbole": str(market), "Unité": str(timeframe),
+            "Signaux clôturés": closed, "Gagnants": wins, "Perdants": losses,
+            "Taux de réussite (%)": round(100 * wins / closed, 2) if closed else None,
+            "R théorique moyen": round(float(th.mean()), 3) if not th.empty else None,
+            "R réel moyen": round(float(real.mean()), 3) if not real.empty else None,
+            "Échantillon suffisant": "Oui" if closed >= int(min_closed) else "Non — petit échantillon",
+        })
+    return pd.DataFrame(rows, columns=columns).sort_values(["Période (UTC)", "Symbole", "Unité"], ascending=[False, True, True]).reset_index(drop=True)
+
+
+def _period_theoretical_r(row):
+    """Return planned R for a closed theoretical outcome, if levels are valid."""
+    try:
+        entry, sl, tp = float(row.get("Entrée")), float(row.get("Stop Loss")), float(row.get("Take Profit"))
+        if not all(pd.notna(v) for v in (entry, sl, tp)):
+            return None
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return None
+        status, side = str(row.get("Résultat", "")), str(row.get("Signal", ""))
+        if status == "PERDANT":
+            return -1.0
+        valid = (side == "ACHAT" and sl < entry < tp) or (side == "VENTE" and tp < entry < sl)
+        return abs(tp - entry) / risk if status == "GAGNANT" and valid else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def test_period_robustness_report():
+    """Small deterministic checks for monthly grouping and separation of real R."""
+    sample = pd.DataFrame([
+        {"Créé à (UTC)": "2026-01-03T10:00:00Z", "Marché": "EURUSD=X", "Unité": "M15", "Résultat": "GAGNANT", "Signal": "ACHAT", "Entrée": 1.1, "Stop Loss": 1.09, "Take Profit": 1.12, "Résultat (R)": 1.7},
+        {"Créé à (UTC)": "2026-01-04T10:00:00Z", "Marché": "EURUSD=X", "Unité": "M15", "Résultat": "PERDANT", "Signal": "ACHAT", "Entrée": 1.1, "Stop Loss": 1.09, "Take Profit": 1.12, "Résultat (R)": -1.0},
+        {"Créé à (UTC)": "2026-02-01T10:00:00Z", "Marché": "EURUSD=X", "Unité": "M15", "Résultat": "OUVERT", "Signal": "ACHAT", "Entrée": 1.1, "Stop Loss": 1.09, "Take Profit": 1.12, "Résultat (R)": None},
+    ])
+    report = build_period_robustness_report(sample, min_closed=2)
+    assert len(report) == 1, "Les signaux ouverts ne doivent pas compter comme clôturés."
+    assert report.iloc[0]["Période (UTC)"] == "2026-01"
+    assert int(report.iloc[0]["Signaux clôturés"]) == 2
+    assert abs(float(report.iloc[0]["Taux de réussite (%)"]) - 50.0) < 1e-9
+    assert report.iloc[0]["Échantillon suffisant"] == "Oui"
+    assert abs(float(report.iloc[0]["R réel moyen"]) - 0.35) < 1e-9
+    return True
+
+
+def build_performance_breakdown(history: pd.DataFrame) -> pd.DataFrame:
+    """Build symbol/timeframe performance metrics without mixing simulated and actual R."""
+    columns = [
+        "Symbole", "Unité", "Signaux", "Clôturés théoriques", "Gagnants théoriques",
+        "Perdants théoriques", "Taux de réussite théorique (%)", "R théorique cumulé",
+        "R théorique moyen / clôturé", "Trades avec R réel renseigné", "R réel cumulé",
+        "R réel moyen / trade renseigné",
+    ]
+    if history is None or history.empty:
+        return pd.DataFrame(columns=columns)
+
+    df = history.copy()
+    required = {"Symbole", "Unité", "Résultat", "Entrée", "Stop Loss", "Take Profit"}
+    if not required.issubset(df.columns):
+        return pd.DataFrame(columns=columns)
+
+    # A theoretical winner earns the planned reward/risk ratio; a theoretical loser is -1R.
+    # These metrics are estimates based on SL/TP status, not broker-confirmed executions.
+    def theoretical_r(row):
+        status = str(row.get("Résultat", ""))
+        try:
+            entry = float(row.get("Entrée"))
+            sl = float(row.get("Stop Loss"))
+            tp = float(row.get("Take Profit"))
+            side = str(row.get("Signal", ""))
+            risk = abs(entry - sl)
+            if risk <= 0 or not all(pd.notna(x) for x in (entry, sl, tp)):
+                return None
+            if status == "PERDANT":
+                return -1.0
+            if status == "GAGNANT":
+                valid = (side == "ACHAT" and sl < entry < tp) or (side == "VENTE" and tp < entry < sl)
+                return abs(tp - entry) / risk if valid else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return None
+
+    df["_R_theorique"] = df.apply(theoretical_r, axis=1)
+    if "Résultat (R)" in df.columns:
+        df["_R_reel"] = pd.to_numeric(df["Résultat (R)"], errors="coerce")
+    else:
+        df["_R_reel"] = float("nan")
+
+    rows = []
+    for (symbol, timeframe), group in df.groupby(["Symbole", "Unité"], dropna=False):
+        statuses = group["Résultat"].fillna("OUVERT").astype(str)
+        closed_mask = statuses.isin(["GAGNANT", "PERDANT"])
+        closed = int(closed_mask.sum())
+        wins = int((statuses == "GAGNANT").sum())
+        losses = int((statuses == "PERDANT").sum())
+        theoretical = pd.to_numeric(group.loc[closed_mask, "_R_theorique"], errors="coerce").dropna()
+        real = pd.to_numeric(group["_R_reel"], errors="coerce").dropna()
+        rows.append({
+            "Symbole": str(symbol) if pd.notna(symbol) else "Inconnu",
+            "Unité": str(timeframe) if pd.notna(timeframe) else "Inconnue",
+            "Signaux": int(len(group)),
+            "Clôturés théoriques": closed,
+            "Gagnants théoriques": wins,
+            "Perdants théoriques": losses,
+            "Taux de réussite théorique (%)": round(100 * wins / closed, 2) if closed else None,
+            "R théorique cumulé": round(float(theoretical.sum()), 3) if len(theoretical) else None,
+            "R théorique moyen / clôturé": round(float(theoretical.mean()), 3) if len(theoretical) else None,
+            "Trades avec R réel renseigné": int(len(real)),
+            "R réel cumulé": round(float(real.sum()), 3) if len(real) else None,
+            "R réel moyen / trade renseigné": round(float(real.mean()), 3) if len(real) else None,
+        })
+    result = pd.DataFrame(rows, columns=columns)
+    return result.sort_values(["Signaux", "Symbole", "Unité"], ascending=[False, True, True]).reset_index(drop=True)
+
+
 init_signal_db()
+
+
+@st.cache_resource(show_spinner=False)
+def record_process_startup():
+    """Enregistre une seule fois le démarrage du processus Streamlit courant."""
+    started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """INSERT INTO runtime_startups (started_at_utc, data_dir, db_path, app_version)
+               VALUES (?, ?, ?, ?)""",
+            (started_at, os.path.abspath(DATA_DIR), os.path.abspath(DB_PATH), "phase52"),
+        )
+        conn.commit()
+    return started_at
+
+
+try:
+    CURRENT_PROCESS_STARTED_AT = record_process_startup()
+except Exception:
+    # Le tableau d'historique indiquera l'erreur si la table ne peut être lue.
+    CURRENT_PROCESS_STARTED_AT = None
+
+
+def get_runtime_startups(limit=20):
+    with sqlite3.connect(DB_PATH) as conn:
+        return pd.read_sql_query(
+            """SELECT started_at_utc AS "Démarrage UTC",
+                      data_dir AS "Répertoire de données",
+                      db_path AS "Base SQLite",
+                      app_version AS "Version"
+               FROM runtime_startups ORDER BY id DESC LIMIT ?""",
+            conn,
+            params=(int(limit),),
+        )
+
+
 # =========================================================
 # 6. DISPLAY HELPERS
 # =========================================================
@@ -1012,6 +1938,156 @@ def display_local_time(value):
     return parsed.tz_convert("Africa/Kinshasa").strftime("%d/%m/%Y %H:%M:%S")
 
 
+
+def run_smc_engine_self_tests():
+    """Run deterministic local tests on core OHLC/SMC helpers; no network calls."""
+    results = []
+
+    def record(name, passed, detail):
+        results.append({"Test": name, "État": "RÉUSSI" if passed else "ÉCHEC", "Détail": detail})
+
+    # OHLC validation must reject impossible candles and duplicate timestamps.
+    times = pd.date_range("2025-01-01", periods=4, freq="h", tz="UTC")
+    sample = pd.DataFrame({
+        "time": list(times) + [times[0]],
+        "open": [10, 10, 10, 10, 10],
+        "high": [11, 11, 9, 11, 11],
+        "low": [9, 9, 8, 9, 9],
+        "close": [10, 10, 10, 10, 10],
+    })
+    cleaned = validate_ohlc(sample)
+    record("Validation OHLC : bougie impossible et doublon", len(cleaned) == 3,
+           f"3 bougies valides attendues, {len(cleaned)} obtenues")
+
+    # Confirmed close beyond all prior highs should yield bullish BOS proxy.
+    rows = []
+    for i in range(12):
+        rows.append({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
+    rows.append({"open": 101.0, "high": 103.0, "low": 100.5, "close": 102.5})
+    structure = analyze_market_structure(pd.DataFrame(rows), lookback=10)
+    record("Structure : cassure haussière confirmée", structure.get("breakout") == "HAUSSIER",
+           f"Résultat obtenu : {structure.get('breakout')}")
+
+    # Final candle sweeps the prior low then closes back above it.
+    rows = []
+    for i in range(20):
+        rows.append({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
+    rows.append({"open": 99.5, "high": 100.5, "low": 98.0, "close": 100.0})
+    sweep = detect_liquidity_sweep(pd.DataFrame(rows), lookback=20)
+    record("Liquidité : sweep haussier avec réintégration", sweep.get("sweep") == "Sweep haussier potentiel",
+           f"Résultat obtenu : {sweep.get('sweep')}")
+
+    # Short input must never produce a confirmed SMC entry.
+    short = pd.DataFrame(rows[:10])
+    setup = _find_confirmed_smc_setup(short, atr=1.0, lookback=20, sweep_window=6)
+    record("SMC : données insuffisantes, aucun signal", setup.get("direction") is None,
+           f"Direction obtenue : {setup.get('direction')}")
+
+    return pd.DataFrame(results)
+
+def run_smc_temporal_integrity_tests():
+    """Check that analysis excludes the latest potentially unfinished candle."""
+    results = []
+
+    def record(name, passed, detail):
+        results.append({"Test": name, "État": "RÉUSSI" if passed else "ÉCHEC", "Détail": detail})
+
+    # Deterministic synthetic OHLC series with enough history for indicators.
+    rng = np.random.default_rng(20261016)
+    n = 120
+    times = pd.date_range("2025-01-01", periods=n, freq="h", tz="UTC")
+    close = 100 + np.cumsum(rng.normal(0, 0.35, n))
+    open_ = np.r_[close[0], close[:-1]]
+    high = np.maximum(open_, close) + rng.uniform(0.05, 0.4, n)
+    low = np.minimum(open_, close) - rng.uniform(0.05, 0.4, n)
+    base = pd.DataFrame({"time": times, "open": open_, "high": high, "low": low, "close": close, "volume": 1000})
+
+    baseline = analyze_timeframe(base)
+    altered = base.copy()
+    # Dramatically alter only the final candle; it must not affect the reported
+    # closed-candle analysis because analyze_timeframe intentionally excludes it.
+    altered.loc[n - 1, ["open", "high", "low", "close"]] = [150.0, 155.0, 145.0, 152.0]
+    changed_last = analyze_timeframe(altered)
+    keys = ["status", "bias", "rsi", "adx", "atr", "macd", "structure", "sweep", "close", "ema_20", "ema_50", "ema_200", "bullish_points", "bearish_points", "candle_time"]
+    same = True
+    differences = []
+    for key in keys:
+        a, b = baseline.get(key), changed_last.get(key)
+        if isinstance(a, (float, int, np.floating)) and isinstance(b, (float, int, np.floating)):
+            equal = (pd.isna(a) and pd.isna(b)) or np.isclose(float(a), float(b), rtol=1e-10, atol=1e-10)
+        else:
+            equal = str(a) == str(b)
+        if not equal:
+            same = False
+            differences.append(key)
+    record("Intégrité temporelle : la dernière bougie n’influence pas l’analyse clôturée", same,
+           "Résultats identiques sur la dernière bougie clôturée" if same else "Champs modifiés : " + ", ".join(differences))
+
+    # Verify the returned timestamp belongs to the last closed candle, not the
+    # final (potentially still forming) candle supplied to the function.
+    expected_time = base.iloc[-2]["time"]
+    actual_time = pd.to_datetime(baseline.get("candle_time"), utc=True, errors="coerce")
+    expected_time = pd.to_datetime(expected_time, utc=True, errors="coerce")
+    timestamp_ok = pd.notna(actual_time) and actual_time == expected_time
+    record("Horodatage : référence à la dernière bougie clôturée", bool(timestamp_ok),
+           f"Attendu : {expected_time}; obtenu : {actual_time}")
+
+    return pd.DataFrame(results)
+
+
+def audit_runtime_configuration(data=None):
+    """Return a local diagnostic report without making additional network calls."""
+    rows = []
+
+    rows.append({
+        "Contrôle": "Correspondance des marchés",
+        "État": "OK" if SYMBOLS and all(isinstance(k, str) and isinstance(v, str) and v for k, v in SYMBOLS.items()) else "À vérifier",
+        "Détail": f"{len(SYMBOLS)} marchés configurés",
+    })
+    rows.append({
+        "Contrôle": "Unités de temps",
+        "État": "OK" if set(INTERVALS).issubset(DEFAULT_SIGNAL_COOLDOWN_MINUTES) else "À vérifier",
+        "Détail": f"{len(INTERVALS)} unités configurées",
+    })
+
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        probe_path = os.path.join(DATA_DIR, ".forexscope_write_test")
+        with open(probe_path, "w", encoding="utf-8") as probe:
+            probe.write("ok")
+        os.remove(probe_path)
+        storage_state = "OK"
+        storage_detail = f"Répertoire accessible : {DATA_DIR}"
+    except OSError as exc:
+        storage_state = "ERREUR"
+        storage_detail = f"Répertoire non accessible ({type(exc).__name__})"
+    rows.append({"Contrôle": "Écriture du stockage", "État": storage_state, "Détail": storage_detail})
+
+    rows.append({
+        "Contrôle": "Base SQLite",
+        "État": "Présente" if os.path.isfile(DB_PATH) else "À initialiser / vérifier",
+        "Détail": DB_PATH,
+    })
+
+    if data is None or data.empty:
+        rows.append({"Contrôle": "Bougies chargées", "État": "INDISPONIBLES", "Détail": "Aucune bougie utilisable pour le marché et l’unité sélectionnés."})
+    else:
+        times = pd.to_datetime(data.get("time"), utc=True, errors="coerce")
+        time_ok = times.notna().all()
+        ordered = bool(times.is_monotonic_increasing) if time_ok else False
+        duplicates = int(times.duplicated().sum()) if time_ok else -1
+        prices = data[["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
+        numeric_ok = bool(np.isfinite(prices.to_numpy(dtype=float)).all())
+        positive_ok = bool((prices > 0).all().all())
+        ohlc_ok = bool(((prices["high"] >= prices[["open", "close", "low"]].max(axis=1)) & (prices["low"] <= prices[["open", "close", "high"]].min(axis=1))).all())
+        checks_ok = time_ok and ordered and duplicates == 0 and numeric_ok and positive_ok and ohlc_ok
+        latest = times.iloc[-1].strftime("%Y-%m-%d %H:%M UTC") if time_ok and len(times) else "indisponible"
+        rows.append({"Contrôle": "Intégrité des bougies", "État": "OK" if checks_ok else "À VÉRIFIER", "Détail": f"{len(data)} bougies ; temps ordonné={ordered} ; doublons={duplicates} ; valeurs numériques={numeric_ok} ; prix positifs={positive_ok} ; OHLC cohérent={ohlc_ok}"})
+        rows.append({"Contrôle": "Horodatage le plus récent", "État": "Information", "Détail": latest})
+
+    return pd.DataFrame(rows)
+
+
 # =========================================================
 # 7. SIDEBAR
 # =========================================================
@@ -1047,17 +2123,16 @@ with st.sidebar:
     st.caption(
         "Source : Yahoo Finance. Disponibilité et délais variables "
         "selon le marché."
-    )
-
-
+        )
+    
 # =========================================================
 # 8. MAIN DASHBOARD
 # =========================================================
 st.title("ForexScope")
 st.caption("Plateforme d'analyse technique et de suivi des marchés.")
 
-tab_market, tab_analysis, tab_history, tab_settings = st.tabs(
-    ["📈 Marché", "🎯 Analyse", "📋 Historique", "⚙️ Paramètres"]
+tab_market, tab_analysis, tab_history, tab_risk, tab_backtest, tab_settings = st.tabs(
+    ["📈 Marché", "🎯 Analyse", "📋 Historique", "🛡️ Gestion du risque", "🧪 Backtesting", "⚙️ Paramètres"]
 )
 
 with st.spinner(f"Chargement des données : {market_name}..."):
@@ -1232,6 +2307,63 @@ with tab_analysis:
             st.markdown("### Signal ForexScope")
 
             signal_result = generate_trading_signal(candles, multi_results)
+            freshness_check = validate_signal_data_freshness(
+                candles, timeframe, multi_results
+            )
+            if not freshness_check["ok"]:
+                signal_result = {
+                    **signal_result,
+                    "signal": "ATTENDRE",
+                    "confidence": 0,
+                    "setup_quality": 0,
+                    "entry": None,
+                    "stop_loss": None,
+                    "take_profit": None,
+                    "risk_reward": None,
+                    "reasons": list(signal_result.get("reasons", []))
+                    + ["Signal bloqué par le contrôle de fraîcheur des données."]
+                    + freshness_check["issues"],
+                }
+                st.warning(
+                    "Signal exploitable bloqué : certaines données sont absentes ou trop anciennes. "
+                    "Vérifie le rapport avant de relancer l’analyse."
+                )
+                for issue in freshness_check["issues"]:
+                    st.write(f"- {issue}")
+
+            # Phase 25: diagnostic transparent des principaux filtres du signal.
+            st.markdown("### Diagnostic des filtres du signal")
+            try:
+                diag_df = calculate_indicators(candles).dropna(subset=["ema_20", "ema_50", "atr", "rsi"])
+                # Exclure la bougie la plus récente, qui peut être encore en formation.
+                diag_closed = diag_df.iloc[:-1].copy()
+                if len(diag_closed) >= 2:
+                    diag_last = diag_closed.iloc[-1]
+                    diag_close = float(diag_last["close"])
+                    diag_atr = float(diag_last["atr"])
+                    diag_ema_dist = abs(diag_close - float(diag_last["ema_20"])) / diag_atr if diag_atr > 0 else None
+                    diag_adx = float(diag_last["adx"]) if pd.notna(diag_last.get("adx")) else None
+                    diag_rsi = float(diag_last["rsi"])
+                    h4_diag = multi_results.get("H4", {})
+                    d1_diag = multi_results.get("D1", {})
+                    h4_bias_diag = h4_diag.get("bias") if h4_diag.get("status") == "OK" else "Indisponible"
+                    d1_bias_diag = d1_diag.get("bias") if d1_diag.get("status") == "OK" else "Indisponible"
+
+                    diag_rows = [
+                        {"Contrôle": "Éloignement EMA20", "Valeur": f"{diag_ema_dist:.2f} ATR" if diag_ema_dist is not None else "Indisponible", "Lecture": "À surveiller : prix étendu" if diag_ema_dist is not None and diag_ema_dist > 1.5 else "Dans le seuil indicatif"},
+                        {"Contrôle": "ADX (force du mouvement)", "Valeur": f"{diag_adx:.1f}" if diag_adx is not None else "Indisponible", "Lecture": "Mouvement faible selon le seuil expérimental" if diag_adx is not None and diag_adx < 12 else "Seuil expérimental atteint" if diag_adx is not None else "Non évalué"},
+                        {"Contrôle": "RSI (14)", "Valeur": f"{diag_rsi:.1f}", "Lecture": "Contexte momentum; à interpréter selon le sens du setup"},
+                        {"Contrôle": "Biais H4", "Valeur": str(h4_bias_diag), "Lecture": "Contexte supérieur disponible" if h4_bias_diag != "Indisponible" else "Confluence H4 non vérifiable"},
+                        {"Contrôle": "Biais D1", "Valeur": str(d1_bias_diag), "Lecture": "Contexte supérieur disponible" if d1_bias_diag != "Indisponible" else "Confluence D1 non vérifiable"},
+                    ]
+                    st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
+                    if h4_bias_diag == "Indisponible" or d1_bias_diag == "Indisponible":
+                        st.info("La confluence H4/D1 est partiellement indisponible : ne traite pas l'absence de données comme une confirmation.")
+                    st.caption("Diagnostic explicatif des filtres appliqués aux données disponibles. Il ne prédit pas le résultat du trade et la qualité du setup n'est pas une probabilité de gain.")
+                else:
+                    st.info("Données insuffisantes pour établir le diagnostic des filtres.")
+            except (KeyError, TypeError, ValueError, IndexError) as diag_error:
+                st.warning(f"Diagnostic des filtres indisponible pour cette série : {diag_error}")
 
             signal_id, created_at_utc, save_status, remaining_seconds = save_signal_record(
                 market=market_name,
@@ -1264,6 +2396,8 @@ with tab_analysis:
                     "Le verdict ATTENDRE n'est pas ajouté à l'historique des "
                     "signaux actionnables."
                 )
+            elif save_status == "invalid_levels":
+                st.error("Signal non enregistré : les niveaux de prix ou l’horodatage ne sont pas cohérents.")
 
             s1, s2, s3 = st.columns(3)
             s1.metric("Décision", signal_result["signal"])
@@ -1284,6 +2418,106 @@ with tab_analysis:
                 p1.metric("Entrée indicative", format_price(signal_result["entry"]))
                 p2.metric("Stop Loss", format_price(signal_result["stop_loss"]))
                 p3.metric("Take Profit", format_price(signal_result["take_profit"]))
+
+                st.markdown("#### Risque et volume théorique pour ce signal")
+                st.caption(
+                    "Estimation liée aux niveaux du signal actuel. Renseigne la valeur du pip "
+                    "dans la devise de ton compte selon les spécifications de ton courtier."
+                )
+                sr1, sr2, sr3 = st.columns(3)
+                with sr1:
+                    signal_balance = st.number_input(
+                        "Capital pour ce signal", min_value=0.0, value=100.0, step=10.0,
+                        key="signal_risk_balance"
+                    )
+                with sr2:
+                    signal_risk_pct = st.number_input(
+                        "Risque du signal (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1,
+                        key="signal_risk_percent"
+                    )
+                with sr3:
+                    signal_pip_size = st.number_input(
+                        "Taille du pip en prix", min_value=0.000001, value=0.0001, format="%.6f",
+                        key="signal_pip_size",
+                        help="Valeur indicative par défaut pour certaines paires Forex. Adapte-la à l'instrument analysé."
+                    )
+                sr4, sr5 = st.columns(2)
+                with sr4:
+                    signal_pip_value = st.number_input(
+                        "Valeur d'un pip pour 1 lot", min_value=0.000001, value=10.0, step=0.5,
+                        key="signal_pip_value",
+                        help="Valeur dans la devise de ton compte, à vérifier auprès du courtier."
+                    )
+                with sr5:
+                    signal_lot_step = st.selectbox(
+                        "Pas de volume", [0.001, 0.01, 0.1, 1.0], index=1,
+                        key="signal_lot_step"
+                    )
+
+                signal_entry = float(signal_result["entry"])
+                signal_sl = float(signal_result["stop_loss"])
+                signal_tp = float(signal_result["take_profit"])
+                signal_side = signal_result["signal"]
+                signal_levels_valid = (
+                    signal_side == "ACHAT" and signal_sl < signal_entry < signal_tp
+                ) or (
+                    signal_side == "VENTE" and signal_tp < signal_entry < signal_sl
+                )
+                signal_stop_distance = abs(signal_entry - signal_sl)
+                signal_risk_cash = signal_balance * signal_risk_pct / 100.0
+                if not signal_levels_valid:
+                    st.error(
+                        "Calcul du volume bloqué : les niveaux Entrée, Stop Loss et Take Profit "
+                        "ne respectent pas le sens du signal. Vérifie les niveaux avant toute décision."
+                    )
+                elif signal_stop_distance > 0 and signal_pip_size > 0 and signal_pip_value > 0:
+                    signal_stop_pips = signal_stop_distance / signal_pip_size
+                    signal_raw_lots = signal_risk_cash / (signal_stop_pips * signal_pip_value) if signal_stop_pips > 0 else 0.0
+                    signal_rounded_lots = np.floor(signal_raw_lots / signal_lot_step) * signal_lot_step
+                    signal_estimated_risk = signal_rounded_lots * signal_stop_pips * signal_pip_value
+                    sr6, sr7, sr8 = st.columns(3)
+                    sr6.metric("Risque prévu", f"{signal_risk_cash:,.2f}")
+                    sr7.metric("Volume théorique", f"{signal_raw_lots:.3f} lot(s)")
+                    sr8.metric("Volume arrondi", f"{signal_rounded_lots:.3f} lot(s)")
+                    st.write(
+                        f"Distance du SL : **{signal_stop_pips:.1f} pips** · "
+                        f"Risque estimé après arrondi : **{signal_estimated_risk:,.2f}** dans la devise du compte."
+                    )
+                    signal_reward_distance = abs(signal_tp - signal_entry)
+                    signal_rr_check = signal_reward_distance / signal_stop_distance if signal_stop_distance > 0 else 0.0
+                    if signal_rr_check < 1.0:
+                        st.warning(
+                            f"Ratio rendement/risque faible : environ 1:{signal_rr_check:.2f}. "
+                            "Vérifie si le potentiel de gain justifie le risque."
+                        )
+                    else:
+                        st.caption(f"Contrôle des niveaux : ratio rendement/risque calculé ≈ 1:{signal_rr_check:.2f}.")
+                    if signal_rounded_lots <= 0:
+                        st.warning("Le risque prévu est trop faible pour atteindre le plus petit volume sélectionné. Ne force pas le volume à la hausse.")
+                    st.caption(
+                        "Estimation uniquement : vérifie la taille du contrat, la valeur du pip, "
+                        "le spread, les commissions, le slippage et la devise du compte dans MT5. "
+                        "Pour l'or, les indices et les CFD, la valeur par défaut du pip peut être incorrecte."
+                    )
+
+                st.markdown("#### Graphique du setup avec niveaux de risque")
+                st.caption(
+                    "Les lignes Entrée, Stop Loss et Take Profit correspondent au signal "
+                    "calculé pour les données actuellement chargées. Ce sont des niveaux indicatifs."
+                )
+                st.plotly_chart(
+                    build_candlestick_chart(
+                        candles,
+                        market_name,
+                        timeframe,
+                        signal_result=signal_result,
+                        show_fvg=True,
+                        show_order_blocks=True,
+                        show_liquidity=True,
+                    ),
+                    use_container_width=True,
+                    key="signal_levels_chart",
+                )
             else:
                 st.info(
                     "Aucun niveau d'entrée, de SL ou de TP n'est proposé "
@@ -1296,46 +2530,713 @@ with tab_analysis:
 
 
 with tab_history:
-    st.subheader("Historique des signaux")
-    history = get_signal_history(limit=100)
+    st.subheader("Historique et suivi des performances")
 
-    if history.empty:
+    st.markdown("**Suivi automatique des signaux — Phase 51**")
+    st.caption(
+        "Compare les niveaux SL/TP enregistrés aux bougies ultérieures disponibles. "
+        "Ce suivi classe le résultat théorique du signal ; il ne confirme pas une exécution réelle sur MT5. "
+        "Si SL et TP sont touchés dans la même bougie, le résultat reste ouvert car l’ordre d’atteinte est inconnu."
+    )
+    if st.button("Vérifier les résultats des signaux ouverts", key="run_auto_signal_outcome_check"):
+        try:
+            updated_count, wins_count, losses_count = auto_check_signal_outcomes(limit=200)
+            st.success(
+                f"Vérification terminée : {updated_count} résultat(s) mis à jour "
+                f"({wins_count} gagnant(s), {losses_count} perdant(s))."
+            )
+        except Exception as outcome_error:
+            st.error(f"La vérification automatique a échoué : {outcome_error}")
+
+    try:
+        outcome_counts, outcome_total, latest_signal = get_signal_outcome_summary()
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Signaux enregistrés", outcome_total)
+        k2.metric("Ouverts / non résolus", outcome_counts.get("OUVERT", 0))
+        k3.metric("Gagnants théoriques", outcome_counts.get("GAGNANT", 0))
+        k4.metric("Perdants théoriques", outcome_counts.get("PERDANT", 0))
+        if latest_signal:
+            st.caption(
+                f"Dernier signal enregistré : #{latest_signal[0]} · {latest_signal[1]} · "
+                f"{latest_signal[2]} · {latest_signal[3]} · statut {latest_signal[4]}"
+            )
+        else:
+            st.info("Aucun signal n’est encore enregistré dans la base active.")
+        st.caption("Les statuts sont calculés à partir des données de marché disponibles et ne déduisent pas les commissions, le spread, le slippage ni les exécutions réelles.")
+    except Exception as outcome_summary_error:
+        st.warning(f"Impossible de calculer le résumé des résultats : {outcome_summary_error}")
+
+    st.divider()
+
+    st.markdown("**Contrôle de sauvegarde et restauration**")
+    st.caption("Teste l’intégrité d’une sauvegarde SQLite, sa restauration vers une base temporaire et les droits d’écriture du répertoire configuré. Les tests n’écrivent pas dans la base active.")
+    if st.button("Tester la sauvegarde et la restauration", key="run_storage_integrity_tests"):
+        storage_tests = run_storage_integrity_tests()
+        st.dataframe(storage_tests, use_container_width=True, hide_index=True)
+        storage_failures = storage_tests[storage_tests["État"] == "ÉCHEC"]
+        if storage_failures.empty:
+            st.success(f"{len(storage_tests)} contrôles de stockage réussis.")
+        else:
+            st.error(f"{len(storage_failures)} contrôle(s) de stockage en échec.")
+        st.download_button(
+            "Exporter les tests de stockage CSV",
+            data=storage_tests.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forexscope_tests_sauvegarde_restauration.csv",
+            mime="text/csv",
+            key="download_storage_integrity_tests",
+        )
+    st.info(
+        f"Répertoire de données actif : {DATA_DIR}. Pour vérifier la persistance après redéploiement, "
+        "il faut aussi confirmer dans les paramètres Render qu’un disque persistant est monté sur ce chemin "
+        "et que FOREXSCOPE_DATA_DIR pointe vers ce même répertoire. Le test local ne peut pas prouver la persistance après redémarrage."
+    )
+    st.markdown("**Diagnostic de continuité après redémarrage**")
+    st.caption(
+        "ForexScope inscrit un événement au premier chargement du processus Streamlit. "
+        "Après un redémarrage ou redéploiement, revenez ici : une nouvelle ligne doit apparaître "
+        "si la même base persistante est conservée."
+    )
+    try:
+        runtime_df = get_runtime_startups(limit=20)
+        if runtime_df.empty:
+            st.warning("Aucun événement de démarrage n’est disponible dans cette base.")
+        else:
+            st.dataframe(runtime_df, use_container_width=True, hide_index=True)
+            if len(runtime_df) >= 2:
+                st.info(
+                    "Plusieurs démarrages sont enregistrés dans la base active. "
+                    "Comparez les dates et le chemin de base après le prochain redéploiement. "
+                    "Cela ne prouve la persistance que si les lignes antérieures sont toujours présentes."
+                )
+            else:
+                st.warning(
+                    "Un seul démarrage est enregistré. La vérification après redéploiement reste à faire."
+                )
+        st.download_button(
+            "Exporter le journal des démarrages CSV",
+            data=runtime_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forexscope_journal_demarrages.csv",
+            mime="text/csv",
+            key="download_runtime_startups",
+        )
+    except Exception as exc:
+        st.error(f"Impossible de lire le journal des démarrages : {exc}")
+
+    st.divider()
+    # Export SQLite complet : permet de conserver une copie de l'historique et du journal.
+    st.markdown("**Sauvegarde complète de ForexScope**")
+    st.caption("Télécharge une copie de la base SQLite actuellement utilisée par cette instance, y compris les signaux et les notes du journal.")
+    try:
+        backup_buffer = io.BytesIO()
+        with sqlite3.connect(DB_PATH) as source_conn:
+            with sqlite3.connect(":memory:") as backup_conn:
+                source_conn.backup(backup_conn)
+                backup_conn.commit()
+                backup_buffer.write(backup_conn.serialize())
+        backup_buffer.seek(0)
+        st.download_button(
+            "Télécharger une sauvegarde complète (.db)",
+            data=backup_buffer.getvalue(),
+            file_name=f"forexscope_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.db",
+            mime="application/octet-stream",
+            key="download_full_database_backup",
+        )
+    except Exception as backup_error:
+        st.warning(f"La sauvegarde complète n'a pas pu être créée : {backup_error}")
+    st.info(
+    "Stockage de la base : " + DB_PATH + ". Sur Render, crée un Persistent Disk, "
+    "monte-le sur /var/data et définis FOREXSCOPE_DATA_DIR=/var/data. "
+    "Sans disque persistant, les données locales peuvent disparaître lors d’un redéploiement."
+)
+
+    st.markdown("**Restaurer une sauvegarde (.db)**")
+    st.caption("La restauration remplace la base actuellement utilisée. Télécharge d'abord une sauvegarde de l'état actuel et vérifie que le fichier choisi provient bien de ForexScope.")
+    uploaded_backup = st.file_uploader(
+        "Choisir un fichier de sauvegarde ForexScope",
+        type=["db", "sqlite", "sqlite3"],
+        key="restore_database_upload",
+    )
+    confirm_restore = st.checkbox(
+        "Je confirme que je veux remplacer la base actuelle par cette sauvegarde.",
+        key="confirm_database_restore",
+    )
+    if st.button("Valider la restauration", key="restore_database_button"):
+        if uploaded_backup is None:
+            st.error("Choisis d'abord un fichier de sauvegarde.")
+        elif not confirm_restore:
+            st.error("Coche la confirmation avant de restaurer.")
+        else:
+            temp_path = None
+            try:
+                file_bytes = uploaded_backup.getvalue()
+                if not file_bytes:
+                    raise ValueError("Le fichier est vide.")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".db", dir=os.path.dirname(os.path.abspath(DB_PATH))) as temp_file:
+                    temp_file.write(file_bytes)
+                    temp_path = temp_file.name
+                with sqlite3.connect(temp_path) as check_conn:
+                    integrity = check_conn.execute("PRAGMA integrity_check").fetchone()
+                    if not integrity or integrity[0] != "ok":
+                        raise ValueError("Le fichier SQLite est endommagé ou invalide.")
+                    tables = {row[0] for row in check_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    if not tables:
+                        raise ValueError("Aucune table n'a été trouvée dans cette base.")
+                # Crée une copie de sécurité de la base actuelle avant le remplacement.
+                safety_path = f"{DB_PATH}.before_restore_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+                if os.path.exists(DB_PATH):
+                    with sqlite3.connect(DB_PATH) as current_conn:
+                        with sqlite3.connect(safety_path) as safety_conn:
+                            current_conn.backup(safety_conn)
+                os.replace(temp_path, DB_PATH)
+                temp_path = None
+                st.success(f"Restauration terminée. Une copie de sécurité locale a été créée : {os.path.basename(safety_path) if os.path.exists(safety_path) else 'aucune base précédente détectée'}.")
+                st.warning("Recharge la page pour relire l'historique restauré. La copie de sécurité est stockée sur le serveur et peut disparaître si son stockage n'est pas persistant.")
+            except Exception as restore_error:
+                st.error(f"Restauration impossible : {restore_error}")
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+    history_raw = get_signal_history(limit=500)
+
+    st.markdown("**Analyse des performances par symbole et unité — Phase 52**")
+    st.caption(
+        "Les résultats théoriques en R sont estimés à partir des statuts GAGNANT/PERDANT et des niveaux SL/TP. "
+        "Les résultats réels en R proviennent uniquement des valeurs saisies dans le journal ; les deux mesures restent séparées."
+    )
+    try:
+        breakdown = build_performance_breakdown(history_raw)
+        if breakdown.empty:
+            st.info("Pas encore assez de données pour établir une ventilation par symbole et unité.")
+        else:
+            st.dataframe(breakdown, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Exporter l'analyse par symbole et unité (CSV)",
+                data=breakdown.to_csv(index=False).encode("utf-8-sig"),
+                file_name="forexscope_performances_symbole_unite.csv",
+                mime="text/csv",
+                key="download_phase52_performance_breakdown",
+            )
+    except Exception as breakdown_error:
+        st.warning(f"Impossible de calculer l'analyse des performances : {breakdown_error}")
+
+    st.divider()
+
+    if history_raw.empty:
         st.info("Aucun signal enregistré pour le moment.")
     else:
-        history["Créé à"] = history["Créé à (UTC)"].apply(display_local_time)
-        history["Bougie analysée"] = history["Bougie analysée (UTC)"].apply(display_local_time)
-        history = history.drop(columns=["Créé à (UTC)", "Bougie analysée (UTC)"])
+        # Résumé calculé sur les signaux conservés dans l'historique.
+        status_series = history_raw["Résultat"]
+        total = len(history_raw)
+        winners = int((status_series == "GAGNANT").sum())
+        losers = int((status_series == "PERDANT").sum())
+        open_count = int((status_series == "OUVERT").sum())
+        closed_count = winners + losers
+        win_rate = (100 * winners / closed_count) if closed_count else 0
 
-        st.dataframe(history, use_container_width=True, hide_index=True)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Signaux suivis", total)
+        m2.metric("Encore ouverts", open_count)
+        m3.metric("Gagnants / perdants", f"{winners} / {losers}")
+        m4.metric("Taux de réussite observé", f"{win_rate:.1f}%" if closed_count else "—")
+        st.caption("Le taux est calculé uniquement sur les signaux marqués GAGNANT ou PERDANT. Il ne mesure pas le profit net et dépend du classement manuel.")
+
+        st.markdown("**Vérification automatique des SL/TP**")
+        st.caption("Compare les bougies disponibles après la bougie du signal. Si SL et TP sont touchés dans la même bougie, le signal reste ouvert pour éviter de deviner l'ordre des événements.")
+        if st.button("Vérifier automatiquement les signaux ouverts"):
+            with st.spinner("Vérification des bougies disponibles…"):
+                checked, auto_wins, auto_losses = auto_check_signal_outcomes(limit=200)
+            st.success(f"Vérification terminée : {checked} résultat(s) classé(s), {auto_wins} gagnant(s), {auto_losses} perdant(s).")
+            st.rerun()
+
+        st.markdown("**Journal détaillé du trade**")
+        st.caption("Consigne les prix réellement exécutés et tes observations. Ces données sont distinctes des niveaux théoriques du signal.")
+        journal_row = editable.loc[editable["ID"] == selected_id].iloc[0] if "selected_id" in locals() else editable.iloc[0]
+        def _number_or_zero(value):
+            try:
+                return float(value) if pd.notna(value) else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+        def _text_or_empty(value):
+            return str(value) if value is not None and pd.notna(value) else ""
+        with st.form("trade_journal_form"):
+            j1, j2 = st.columns(2)
+            with j1:
+                actual_entry = st.number_input("Prix d'entrée réellement exécuté (0 = inconnu)", min_value=0.0, value=_number_or_zero(journal_row.get("Entrée réelle")), format="%.6f")
+                actual_exit = st.number_input("Prix de sortie réellement exécuté (0 = inconnu)", min_value=0.0, value=_number_or_zero(journal_row.get("Sortie réelle")), format="%.6f")
+            with j2:
+                previous_r = journal_row.get("Résultat (R)")
+                default_r = _number_or_zero(previous_r)
+                realized_r = st.number_input("Résultat réalisé en R (gain positif, perte négative)", value=default_r, min_value=-100.0, max_value=100.0, step=0.1, format="%.2f")
+                st.caption("1R correspond au risque initial prévu. Saisis la valeur calculée à partir de ton résultat réel.")
+            journal_notes = st.text_area("Revue du setup", value=_text_or_empty(journal_row.get("Notes de revue")), placeholder="Contexte, qualité du setup, respect du plan, leçon à retenir…")
+            execution_notes = st.text_area("Exécution et coûts", value=_text_or_empty(journal_row.get("Notes d'exécution")), placeholder="Spread, commission, slippage, raison d'une sortie anticipée…")
+            journal_submit = st.form_submit_button("Enregistrer le journal du trade")
+        if journal_submit:
+            update_trade_journal(selected_id, actual_entry, actual_exit, realized_r, journal_notes, execution_notes)
+            st.success("Journal du trade enregistré.")
+            st.rerun()
+
+        st.markdown("**Mettre à jour le résultat d'un signal**")
+        editable = history_raw.copy()
+        choices = {
+            int(row["ID"]): f'#{int(row["ID"])} · {row["Marché"]} · {row["Unité"]} · {row["Signal"]} · {row["Résultat"]}'
+            for _, row in editable.iterrows()
+        }
+        selected_id = st.selectbox("Signal à évaluer", options=list(choices), format_func=lambda value: choices[value])
+        current_status = str(editable.loc[editable["ID"] == selected_id, "Résultat"].iloc[0])
+        status_options = ["OUVERT", "GAGNANT", "PERDANT", "NEUTRE"]
+        selected_status = st.selectbox("Résultat observé", options=status_options, index=status_options.index(current_status) if current_status in status_options else 0)
+        if st.button("Enregistrer le résultat", type="primary"):
+            update_signal_outcome(selected_id, selected_status)
+            st.success("Résultat mis à jour.")
+            st.rerun()
+
+        display_history = history_raw.copy()
+        display_history["Créé à"] = display_history["Créé à (UTC)"].apply(display_local_time)
+        display_history["Bougie analysée"] = display_history["Bougie analysée (UTC)"].apply(display_local_time)
+        display_history["Résultat actualisé"] = display_history["Résultat actualisé (UTC)"].apply(display_local_time)
+        display_history = display_history.drop(columns=["Créé à (UTC)", "Bougie analysée (UTC)", "Résultat actualisé (UTC)"])
+        st.dataframe(display_history, use_container_width=True, hide_index=True)
         st.download_button(
             label="Télécharger l'historique CSV",
-            data=history.to_csv(index=False).encode("utf-8"),
+            data=display_history.to_csv(index=False).encode("utf-8"),
             file_name="forexscope_historique.csv",
             mime="text/csv",
         )
 
-with tab_settings:
-    st.subheader("Paramètres de données")
-    st.write("Fournisseur : Yahoo Finance")
-    st.write(f"Symbole Yahoo : {SYMBOLS[market_name]}")
-    st.write(f"Unité sélectionnée : {timeframe}")
-    st.write(f"Nombre de bougies demandé : {candle_count}")
-    st.warning(
-        "Les données peuvent être retardées, incomplètes ou indisponibles. "
-        "Les bougies H4 sont reconstruites à partir des bougies H1."
-    )
+
+with tab_risk:
+    st.subheader("Calculateur de risque par position")
     st.caption(
-        "Les FVG et Order Blocks affichés sont des zones candidates détectées "
-        "par des règles mécaniques. Ils doivent être validés par le contexte "
-        "et ne constituent pas, à eux seuls, un signal d'entrée."
+        "Outil de préparation : il calcule le montant risqué et le ratio rendement/risque. "
+        "La taille en unités est une approximation et dépend de la devise du compte, "
+        "de la paire et des spécifications du courtier."
     )
 
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        account_balance = st.number_input(
+            "Capital du compte", min_value=0.0, value=100.0, step=10.0,
+            help="Saisis le solde dans la devise de ton compte."
+        )
+    with r2:
+        risk_percent = st.number_input(
+            "Risque souhaité (%)", min_value=0.1, max_value=5.0,
+            value=1.0, step=0.1,
+            help="Pour apprendre, de nombreux traders étudient des risques faibles, sans garantie de résultat."
+        )
+    with r3:
+        entry_price = st.number_input(
+            "Prix d'entrée", min_value=0.0000001, value=1.10000,
+            format="%.6f", help="Remplace cette valeur par le prix d'entrée envisagé."
+        )
 
-st.divider()
-st.caption(
-    "ForexScope • Page actualisée à : "
-    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    r4, r5 = st.columns(2)
+    with r4:
+        stop_price = st.number_input(
+            "Stop Loss", min_value=0.0000001, value=1.09500,
+            format="%.6f", help="Le Stop Loss doit être différent du prix d'entrée."
+        )
+    with r5:
+        target_price = st.number_input(
+            "Take Profit", min_value=0.0000001, value=1.11000,
+            format="%.6f", help="Le Take Profit doit être placé dans le sens du trade."
+        )
+
+    risk_cash = account_balance * risk_percent / 100.0
+    stop_distance = abs(entry_price - stop_price)
+    reward_distance = abs(target_price - entry_price)
+    valid_direction = (target_price > entry_price > stop_price) or (target_price < entry_price < stop_price)
+
+    if stop_distance <= 0:
+        st.error("Le prix d'entrée et le Stop Loss doivent être différents.")
+    else:
+        rr_ratio = reward_distance / stop_distance
+        units_approx = risk_cash / stop_distance
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Montant exposé au risque", f"{risk_cash:,.2f}")
+        k2.metric("Distance entrée–SL", f"{stop_distance:.6f}")
+        k3.metric("Ratio rendement/risque", f"1:{rr_ratio:.2f}")
+        k4.metric("Taille indicative", f"{units_approx:,.2f} unités")
+
+        if not valid_direction:
+            st.warning("Vérifie le sens des niveaux : pour un achat, TP > entrée > SL ; pour une vente, TP < entrée < SL.")
+        if rr_ratio < 1.0:
+            st.warning("Le gain potentiel est inférieur au risque prévu (ratio inférieur à 1:1).")
+        st.info(
+            f"Si le Stop Loss est exécuté au niveau prévu, la perte théorique serait d'environ "
+            f"{risk_cash:,.2f} dans la devise du compte, hors spread, commission et slippage."
+        )
+        st.warning(
+            "La taille en unités est une approximation mathématique, pas un nombre de lots MT5 fiable. "
+            "Pour les paires Forex, l'or, les indices et les CFD, vérifie la valeur du tick/pip, "
+            "la taille du contrat et la devise du compte auprès du courtier avant toute utilisation."
+        )
+
+    st.divider()
+    st.subheader("Estimateur de lots MT5 avec valeur du pip fournie")
+    st.caption(
+        "Saisis les spécifications affichées par ton courtier. Cet estimateur n'invente pas la valeur du pip : "
+        "il utilise les valeurs que tu fournis et ne remplace pas la vérification dans MT5."
+    )
+    lot1, lot2, lot3 = st.columns(3)
+    with lot1:
+        pip_size = st.number_input(
+            "Taille d'un pip en prix", min_value=0.000001, value=0.0001, format="%.6f",
+            help="Exemple courant : 0,0001 pour beaucoup de paires Forex; 0,01 pour certaines paires en JPY. Vérifie l'instrument."
+        )
+    with lot2:
+        pip_value_per_lot = st.number_input(
+            "Valeur d'un pip pour 1 lot", min_value=0.000001, value=10.0, step=0.5,
+            help="Valeur dans la devise de ton compte, vérifiée pour cet instrument chez ton courtier."
+        )
+    with lot3:
+        lot_step = st.selectbox("Pas de volume du courtier", [0.001, 0.01, 0.1, 1.0], index=1)
+
+    if stop_distance > 0 and pip_size > 0 and pip_value_per_lot > 0:
+        stop_pips = stop_distance / pip_size
+        lot_calculation = calculate_broker_lot_size(
+            risk_cash=risk_cash, stop_pips=stop_pips,
+            pip_value_per_lot=pip_value_per_lot, lot_step=lot_step,
+            min_lot=lot_step,
+        )
+        raw_lots = lot_calculation["raw_lots"]
+        rounded_lots = lot_calculation["rounded_lots"]
+        rounded_risk = lot_calculation["estimated_risk"]
+        l1, l2, l3 = st.columns(3)
+        l1.metric("Distance du SL", f"{stop_pips:.1f} pips")
+        l2.metric("Volume théorique", f"{raw_lots:.3f} lot(s)")
+        l3.metric("Volume arrondi vers le bas", f"{rounded_lots:.3f} lot(s)")
+        st.write(f"Risque estimé après arrondi : **{rounded_risk:,.2f}** dans la devise du compte.")
+        if rounded_lots <= 0:
+            st.warning("Le risque autorisé est trop faible pour atteindre le plus petit volume sélectionné. Ne force pas le volume à la hausse.")
+        if rounded_risk > risk_cash + 1e-9:
+            st.error("Le volume dépasse le risque prévu. Réduis le volume et vérifie les paramètres.")
+        st.caption(
+            "Hypothèses : valeur du pip constante, exécution au SL prévu, sans spread, commission, slippage ni conversion de devise. "
+            "Ne pas utiliser le résultat avant vérification des spécifications du symbole dans MT5."
         )
 
 
-   
+
+def run_sensitivity_backtest(raw_data, strategy, rr_value, cost_r):
+    """Backtest mécanique pour comparer les hypothèses R:R et de coûts."""
+    frame = calculate_indicators(raw_data.copy()).reset_index(drop=True)
+    needed = ["open", "high", "low", "close", "ema_20", "ema_50", "atr"]
+    frame = frame.dropna(subset=needed).reset_index(drop=True)
+    trades = []
+    i = 1
+    while i < len(frame) - 1:
+        prev, cur = frame.iloc[i - 1], frame.iloc[i]
+        atr = float(cur["atr"])
+        if not np.isfinite(atr) or atr <= 0:
+            i += 1
+            continue
+        entry_i = i + 1
+        entry = float(frame.iloc[entry_i]["open"])
+        if strategy == "EMA20/EMA50":
+            up = prev["ema_20"] <= prev["ema_50"] and cur["ema_20"] > cur["ema_50"]
+            down = prev["ema_20"] >= prev["ema_50"] and cur["ema_20"] < cur["ema_50"]
+            if not (up or down):
+                i += 1
+                continue
+            side = "ACHAT" if up else "VENTE"
+            risk_dist = atr
+            sl = entry - risk_dist if side == "ACHAT" else entry + risk_dist
+        else:
+            setup = _find_confirmed_smc_setup(frame.iloc[:i + 1].copy(), atr)
+            if setup.get("direction") not in ("Haussier", "Baissier"):
+                i += 1
+                continue
+            side = "ACHAT" if setup["direction"] == "Haussier" else "VENTE"
+            sweep_extreme = float(setup["sweep_extreme"])
+            sl = sweep_extreme - 0.2 * atr if side == "ACHAT" else sweep_extreme + 0.2 * atr
+            risk_dist = entry - sl if side == "ACHAT" else sl - entry
+            if not np.isfinite(risk_dist) or risk_dist <= 0 or risk_dist > 2.5 * atr:
+                i += 1
+                continue
+        tp = entry + risk_dist * float(rr_value) if side == "ACHAT" else entry - risk_dist * float(rr_value)
+        outcome = "OUVERT"
+        exit_i = len(frame) - 1
+        gross_r = ((float(frame.iloc[-1]["close"]) - entry) if side == "ACHAT" else (entry - float(frame.iloc[-1]["close"]))) / risk_dist
+        for j in range(entry_i, len(frame)):
+            candle = frame.iloc[j]
+            hit_sl = float(candle["low"]) <= sl if side == "ACHAT" else float(candle["high"]) >= sl
+            hit_tp = float(candle["high"]) >= tp if side == "ACHAT" else float(candle["low"]) <= tp
+            if hit_sl and hit_tp:
+                outcome, exit_i, gross_r = "AMBIGU", j, np.nan
+                break
+            if hit_sl:
+                outcome, exit_i, gross_r = "PERDANT", j, -1.0
+                break
+            if hit_tp:
+                outcome, exit_i, gross_r = "GAGNANT", j, float(rr_value)
+                break
+        if outcome in ("GAGNANT", "PERDANT"):
+            trades.append({"Résultat": outcome, "R brut": float(gross_r), "R net estimé": float(gross_r) - float(cost_r), "Entrée": frame.iloc[entry_i]["time"]})
+        i = max(entry_i + 1, exit_i + 1)
+    return trades
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def run_smc_filter_rejection_audit(raw_data):
+    """Compte les raisons de rejet des setups SMC mécaniques sans simuler de trades.
+
+    Les catégories de rejet sont non exclusives : un setup peut échouer à plusieurs
+    filtres. Les statistiques décrivent la logique de filtre, pas la qualité future.
+    """
+    empty = pd.DataFrame(columns=["Contrôle", "Occurrences", "% des setups candidats"])
+    if raw_data is None or len(raw_data) < 80:
+        return empty, pd.DataFrame()
+
+    frame = calculate_indicators(raw_data.copy()).reset_index(drop=True)
+    needed = ["open", "high", "low", "close", "ema_20", "ema_50", "rsi", "atr", "adx"]
+    frame = frame.dropna(subset=[c for c in needed if c in frame.columns]).reset_index(drop=True)
+    if len(frame) < 80:
+        return empty, pd.DataFrame()
+
+    counts = {
+        "Setups SMC candidats": 0,
+        "Rejetés : risque/SL invalide": 0,
+        "Rejetés : momentum EMA/RSI": 0,
+        "Rejetés : prix trop éloigné EMA20": 0,
+        "Rejetés : ADX sous le seuil": 0,
+        "Conservent tous les filtres": 0,
+    }
+    examples = []
+    for i in range(60, len(frame) - 1):
+        cur = frame.iloc[i]
+        atr = float(cur["atr"])
+        if not np.isfinite(atr) or atr <= 0:
+            continue
+        setup = _find_confirmed_smc_setup(frame.iloc[:i + 1].copy(), atr)
+        direction = setup.get("direction")
+        if direction not in ("Haussier", "Baissier"):
+            continue
+        counts["Setups SMC candidats"] += 1
+        side = "ACHAT" if direction == "Haussier" else "VENTE"
+        entry = float(frame.iloc[i + 1]["open"])
+        sweep_extreme = float(setup.get("sweep_extreme", np.nan))
+        sl = sweep_extreme - 0.2 * atr if side == "ACHAT" else sweep_extreme + 0.2 * atr
+        risk_dist = entry - sl if side == "ACHAT" else sl - entry
+        risk_ok = np.isfinite(risk_dist) and 0 < risk_dist <= 2.5 * atr
+        if not risk_ok:
+            counts["Rejetés : risque/SL invalide"] += 1
+            examples.append({"Heure setup": cur.get("time", i), "Sens": side, "Statut": "Rejet risque/SL", "Distance EMA20 (ATR)": np.nan, "ADX": float(cur["adx"]) if pd.notna(cur["adx"]) else np.nan})
+            continue
+
+        ema20, ema50, rsi = float(cur["ema_20"]), float(cur["ema_50"]), float(cur["rsi"])
+        adx = float(cur["adx"]) if pd.notna(cur["adx"]) else None
+        distance = abs(float(cur["close"]) - ema20) / atr
+        momentum_ok = (ema20 > ema50 and rsi >= 50) if side == "ACHAT" else (ema20 < ema50 and rsi <= 50)
+        distance_ok = distance <= 1.5
+        adx_ok = adx is None or adx >= 12
+        if not momentum_ok:
+            counts["Rejetés : momentum EMA/RSI"] += 1
+        if not distance_ok:
+            counts["Rejetés : prix trop éloigné EMA20"] += 1
+        if not adx_ok:
+            counts["Rejetés : ADX sous le seuil"] += 1
+        if momentum_ok and distance_ok and adx_ok:
+            counts["Conservent tous les filtres"] += 1
+            status = "Conservé"
+        else:
+            failed = []
+            if not momentum_ok: failed.append("momentum EMA/RSI")
+            if not distance_ok: failed.append("distance EMA20")
+            if not adx_ok: failed.append("ADX")
+            status = "Rejet : " + ", ".join(failed)
+        examples.append({"Heure setup": cur.get("time", i), "Sens": side, "Statut": status, "Distance EMA20 (ATR)": round(distance, 3), "ADX": round(adx, 2) if adx is not None else np.nan})
+
+    total = counts["Setups SMC candidats"]
+    rows = []
+    for name, value in counts.items():
+        if name == "Setups SMC candidats":
+            rows.append({"Contrôle": name, "Occurrences": value, "% des setups candidats": 100.0 if value else 0.0})
+        else:
+            rows.append({"Contrôle": name, "Occurrences": value, "% des setups candidats": (value / total * 100.0) if total else 0.0})
+    return pd.DataFrame(rows), pd.DataFrame(examples)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def bootstrap_expectancy_interval(trades_df, iterations=1000, seed=42):
+    """Intervalle bootstrap descriptif de l'espérance en R; ne corrige pas la dépendance temporelle."""
+    if trades_df is None or trades_df.empty or "R net estimé" not in trades_df.columns:
+        return {"Trades": 0, "Espérance (R/trade)": np.nan, "IC 95 % bas (R)": np.nan, "IC 95 % haut (R)": np.nan, "Interprétation": "Pas assez de données"}
+    values = pd.to_numeric(trades_df["R net estimé"], errors="coerce").dropna().to_numpy(dtype=float)
+    n = len(values)
+    if n < 2:
+        mean = float(np.mean(values)) if n else np.nan
+        return {"Trades": n, "Espérance (R/trade)": mean, "IC 95 % bas (R)": np.nan, "IC 95 % haut (R)": np.nan, "Interprétation": "Au moins 2 trades requis"}
+    rng = np.random.default_rng(seed)
+    samples = rng.choice(values, size=(iterations, n), replace=True).mean(axis=1)
+    low, high = np.percentile(samples, [2.5, 97.5])
+    if low > 0:
+        label = "Intervalle positif (indicatif)"
+    elif high < 0:
+        label = "Intervalle négatif (indicatif)"
+    else:
+        label = "Intervalle recouvrant zéro"
+    return {"Trades": n, "Espérance (R/trade)": float(np.mean(values)), "IC 95 % bas (R)": float(low), "IC 95 % haut (R)": float(high), "Interprétation": label}
+
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def run_smc_chronological_windows(raw_data, windows=4, rr_value=2.0, cost_r=0.02):
+    """Évalue les règles SMC fixes sur des fenêtres chronologiques successives.
+
+    Chaque fenêtre est évaluée séparément; ce n'est pas un véritable apprentissage
+    walk-forward ni une preuve de performance future.
+    """
+    if raw_data is None or raw_data.empty:
+        return pd.DataFrame(), {}
+    data = raw_data.copy().reset_index(drop=True)
+    windows = max(2, min(int(windows), 6))
+    # Fenêtres contiguës, sans mélange aléatoire des bougies.
+    boundaries = np.linspace(0, len(data), windows + 1, dtype=int)
+    rows, details = [], {}
+    for idx in range(windows):
+        start, end = int(boundaries[idx]), int(boundaries[idx + 1])
+        segment = data.iloc[start:end].copy()
+        label = f"Fenêtre {idx + 1}"
+        if len(segment) < 100:
+            rows.append({"Fenêtre": label, "Début": str(segment.iloc[0].get("time", start)) if len(segment) else "—", "Fin": str(segment.iloc[-1].get("time", end)) if len(segment) else "—", "Bougies": len(segment), "Variante": "—", "Trades classés": 0, "Espérance (R/trade)": np.nan, "Résultat net (R)": np.nan, "Statut": "Fenêtre trop courte (<100 bougies)"})
+            continue
+        try:
+            summary, trade_groups = run_smc_filter_comparison(segment, rr_value=float(rr_value), cost_r=float(cost_r))
+            for _, metric in summary.iterrows():
+                variant = str(metric.get("Variante", "Inconnue"))
+                trade_df = trade_groups.get(variant, pd.DataFrame()).copy()
+                count = int(metric.get("Trades classés", 0) or 0)
+                rows.append({
+                    "Fenêtre": label,
+                    "Début": str(segment.iloc[0].get("time", start)),
+                    "Fin": str(segment.iloc[-1].get("time", end)),
+                    "Bougies": len(segment),
+                    "Variante": variant,
+                    "Trades classés": count,
+                    "Espérance (R/trade)": metric.get("Espérance (R/trade)", np.nan),
+                    "Résultat net (R)": metric.get("Résultat net estimé (R)", np.nan),
+                    "Taux de réussite (%)": metric.get("Taux de réussite (%)", np.nan),
+                    "Facteur de profit": metric.get("Facteur de profit", np.nan),
+                    "Statut": "Échantillon faible" if count < 30 else "À examiner",
+                })
+                details[f"{label} — {variant}"] = trade_df
+        except Exception as exc:
+            rows.append({"Fenêtre": label, "Début": str(segment.iloc[0].get("time", start)), "Fin": str(segment.iloc[-1].get("time", end)), "Bougies": len(segment), "Variante": "—", "Trades classés": 0, "Espérance (R/trade)": np.nan, "Résultat net (R)": np.nan, "Statut": f"Erreur : {type(exc).__name__}"})
+    return pd.DataFrame(rows), details
+
+
+def summarize_smc_window_stability(results):
+    """Résume la stabilité des résultats par variante sans mélanger les fenêtres."""
+    if results is None or results.empty or not {"Variante", "Espérance (R/trade)"}.issubset(results.columns):
+        return pd.DataFrame()
+    frame = results.copy()
+    frame["Espérance (R/trade)"] = pd.to_numeric(frame["Espérance (R/trade)"], errors="coerce")
+    if "Trades classés" in frame.columns:
+        frame["Trades classés"] = pd.to_numeric(frame["Trades classés"], errors="coerce").fillna(0)
+    rows = []
+    for variant, group in frame.groupby("Variante", dropna=False):
+        valid = group.dropna(subset=["Espérance (R/trade)"])
+        if valid.empty:
+            rows.append({"Variante": str(variant), "Fenêtres évaluées": 0, "Fenêtres à espérance positive (%)": np.nan,
+                         "Espérance médiane (R/trade)": np.nan, "Pire espérance (R/trade)": np.nan,
+                         "Écart-type entre fenêtres": np.nan, "Trades classés total": int(group.get("Trades classés", pd.Series(dtype=float)).sum()),
+                         "Interprétation": "Données insuffisantes"})
+            continue
+        vals = valid["Espérance (R/trade)"].astype(float)
+        pos_share = float((vals > 0).mean() * 100.0)
+        total_trades = int(group.get("Trades classés", pd.Series(dtype=float)).sum())
+        if len(valid) < 3 or total_trades < 30:
+            label = "Échantillon trop faible pour conclure"
+        elif pos_share >= 75 and float(vals.median()) > 0:
+            label = "Résultats positifs dans la majorité des fenêtres; à confirmer"
+        elif pos_share <= 25 and float(vals.median()) < 0:
+            label = "Résultats négatifs dans la majorité des fenêtres"
+        else:
+            label = "Résultats variables selon la période"
+        rows.append({"Variante": str(variant), "Fenêtres évaluées": int(len(valid)),
+                     "Fenêtres à espérance positive (%)": pos_share,
+                     "Espérance médiane (R/trade)": float(vals.median()),
+                     "Pire espérance (R/trade)": float(vals.min()),
+                     "Écart-type entre fenêtres": float(vals.std(ddof=1)) if len(vals) > 1 else 0.0,
+                     "Trades classés total": total_trades, "Interprétation": label})
+    return pd.DataFrame(rows)
+
+def run_smc_filter_comparison(raw_data, rr_value=2.0, cost_r=0.02):
+    """Compare le setup SMC mécanique avant/après filtres locaux sur les mêmes bougies.
+
+    Ce test est volontairement distinct du moteur live : il ne simule pas la confluence H4/D1.
+    Les entrées se font à l'ouverture suivante et les cas SL/TP dans la même bougie sont ambigus.
+    """
+    frame = calculate_indicators(raw_data.copy()).reset_index(drop=True)
+    needed = ["open", "high", "low", "close", "ema_20", "ema_50", "rsi", "atr", "adx"]
+    frame = frame.dropna(subset=[c for c in needed if c in frame.columns]).reset_index(drop=True)
+    variants = {"SMC de base": [], "SMC + filtres phase 22": []}
+    # Comptabiliser aussi les trades non classés pour rendre visible le biais d'exclusion.
+    outcome_counts = {name: {"Ambigus (SL et TP même bougie)": 0, "Non résolus (fin des données)": 0} for name in variants}
+    i = max(60, 1)
+    while i < len(frame) - 1:
+        cur = frame.iloc[i]
+        atr = float(cur["atr"])
+        if not np.isfinite(atr) or atr <= 0:
+            i += 1
+            continue
+        history = frame.iloc[:i + 1].copy()
+        setup = _find_confirmed_smc_setup(history, atr)
+        direction = setup.get("direction")
+        if direction not in ("Haussier", "Baissier"):
+            i += 1
+            continue
+        side = "ACHAT" if direction == "Haussier" else "VENTE"
+        entry_i = i + 1
+        entry = float(frame.iloc[entry_i]["open"])
+        sweep_extreme = float(setup["sweep_extreme"])
+        sl = sweep_extreme - 0.2 * atr if side == "ACHAT" else sweep_extreme + 0.2 * atr
+        risk_dist = entry - sl if side == "ACHAT" else sl - entry
+        if not np.isfinite(risk_dist) or risk_dist <= 0 or risk_dist > 2.5 * atr:
+            i += 1
+            continue
+
+        # Base : structure SMC + stop valide. Filtered : mêmes conditions, plus filtres locaux.
+        variants_to_test = ["SMC de base"]
+        ema20 = float(cur["ema_20"])
+        ema50 = float(cur["ema_50"])
+        rsi = float(cur["rsi"])
+        adx = float(cur["adx"]) if pd.notna(cur["adx"]) else None
+        ema_distance_atr = abs(float(cur["close"]) - ema20) / atr
+        momentum_ok = (ema20 > ema50 and rsi >= 50) if side == "ACHAT" else (ema20 < ema50 and rsi <= 50)
+        filters_ok = momentum_ok and ema_distance_atr <= 1.5 and (adx is None or adx >= 12)
+        if filters_ok:
+            variants_to_test.append("SMC + filtres phase 22")
+
+        tp = entry + risk_dist * float(rr_value) if side == "ACHAT" else entry - risk_dist * float(rr_value)
+        outcome = "OUVERT"
+        gross_r = np.nan
+        exit_i = len(frame) - 1
+        for j in range(entry_i, len(frame)):
+            candle = frame.iloc[j]
+            hit_sl = float(candle["low"]) <= sl if side == "ACHAT" else float(candle["high"]) >= sl
+            hit_tp = float(candle["high"]) >= tp if side == "ACHAT" else float(candle["low"]) <= tp
+            if hit_sl and hit_tp:
+                outcome, exit_i, gross_r = "AMBIGU", j, np.nan
+                break
+            if hit_sl:
+                outcome, exit_i, gross_r = "PERDANT", j, -1.0
+                break
+            if hit_tp:
+                outcome, exit_i, gross_r = "GAGNANT", j, float(rr_value)
+                break
+        if outcome in ("GAGNANT", "PERDANT"):
+            trade = {"Résultat": outcome, "R brut": float(gross_r), "R net estimé": float(gross_r) - float(cost_r), "Entrée": frame.iloc[entry_i]["time"]}
+            for variant in variants_to_test:
+                variants[variant].append(trade.copy())
+        
+        
+            
+
+
+        
