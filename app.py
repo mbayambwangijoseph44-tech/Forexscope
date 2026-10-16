@@ -3234,8 +3234,1231 @@ def run_smc_filter_comparison(raw_data, rr_value=2.0, cost_r=0.02):
             trade = {"Résultat": outcome, "R brut": float(gross_r), "R net estimé": float(gross_r) - float(cost_r), "Entrée": frame.iloc[entry_i]["time"]}
             for variant in variants_to_test:
                 variants[variant].append(trade.copy())
-        
-        
+        else:
+            label = "Ambigus (SL et TP même bougie)" if outcome == "AMBIGU" else "Non résolus (fin des données)"
+            for variant in variants_to_test:
+                outcome_counts[variant][label] += 1
+        # Ne pas réutiliser les mêmes bougies de trade comme entrées simultanées.
+        i = max(entry_i, exit_i + 1)
+
+    rows = []
+    details = {}
+    for name, trades in variants.items():
+        details[name] = pd.DataFrame(trades)
+        df = details[name]
+        wins = int((df["Résultat"] == "GAGNANT").sum()) if not df.empty else 0
+        losses = int((df["Résultat"] == "PERDANT").sum()) if not df.empty else 0
+        count = wins + losses
+        net = float(df["R net estimé"].sum()) if count else 0.0
+        expectancy = float(df["R net estimé"].mean()) if count else 0.0
+        gross_wins = float(df.loc[df["R net estimé"] > 0, "R net estimé"].sum()) if count else 0.0
+        gross_losses = abs(float(df.loc[df["R net estimé"] < 0, "R net estimé"].sum())) if count else 0.0
+        pf = gross_wins / gross_losses if gross_losses > 0 else np.nan
+        rows.append({"Variante": name, "Trades classés": count, "Gagnants": wins, "Perdants": losses,
+                     "Ambigus (SL et TP même bougie)": outcome_counts[name]["Ambigus (SL et TP même bougie)"],
+                     "Non résolus (fin des données)": outcome_counts[name]["Non résolus (fin des données)"],
+                     "Taux de réussite (%)": (wins / count * 100.0) if count else 0.0,
+                     "Résultat net estimé (R)": net, "Espérance (R/trade)": expectancy,
+                     "Facteur de profit": pf})
+    return pd.DataFrame(rows), details
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def run_smc_walk_forward(raw_data, folds=3, rr_value=2.0, cost_r=0.02):
+    """Évalue l'approximation SMC sur des segments chronologiques distincts.
+
+    Chaque segment est testé séparément; les segments courts sont ignorés.
+    Ce test de stabilité n'est pas un walk-forward optimisé sans biais de recherche.
+    """
+    if raw_data is None or len(raw_data) < folds * 100:
+        return pd.DataFrame(), {}
+    frame = raw_data.sort_values("time").reset_index(drop=True) if "time" in raw_data.columns else raw_data.reset_index(drop=True)
+    chunks = [chunk.reset_index(drop=True) for chunk in np.array_split(frame, int(folds))]
+    rows = []
+    details = {}
+    for idx, chunk in enumerate(chunks, start=1):
+        if len(chunk) < 100:
+            continue
+        summary, trades_by_variant = run_smc_filter_comparison(chunk, rr_value=rr_value, cost_r=cost_r)
+        for variant, trades in trades_by_variant.items():
+            details[f"Période {idx} — {variant}"] = trades.copy()
+            if trades.empty:
+                wins = losses = count = 0
+                net = expectancy = 0.0
+                profit_factor = np.nan
+            else:
+                wins = int((trades["Résultat"] == "GAGNANT").sum())
+                losses = int((trades["Résultat"] == "PERDANT").sum())
+                count = wins + losses
+                net = float(trades["R net estimé"].sum()) if count else 0.0
+                expectancy = float(trades["R net estimé"].mean()) if count else 0.0
+                gross_wins = float(trades.loc[trades["R net estimé"] > 0, "R net estimé"].sum())
+                gross_losses = abs(float(trades.loc[trades["R net estimé"] < 0, "R net estimé"].sum()))
+                profit_factor = gross_wins / gross_losses if gross_losses > 0 else np.nan
+            rows.append({"Période chronologique": idx, "Variante": variant, "Bougies": len(chunk),
+                         "Trades classés": count, "Gagnants": wins, "Perdants": losses,
+                         "Taux de réussite (%)": wins / count * 100.0 if count else 0.0,
+                         "Résultat net estimé (R)": net, "Espérance (R/trade)": expectancy,
+                         "Facteur de profit": profit_factor})
+    return pd.DataFrame(rows), details
+
+
+with tab_backtest:
+    st.subheader("Backtesting historique — EMA ou SMC")
+    st.caption(
+        "Simulation pédagogique sur les bougies Yahoo Finance disponibles. "
+        "Choisis entre le croisement EMA20/EMA50 et une approximation mécanique du setup SMC (sweep → cassure → impulsion). "
+        "Les entrées sont simulées à l'ouverture de la bougie suivante. Les résultats restent pédagogiques et ne garantissent pas les performances futures."
+    )
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        bt_timeframe = st.selectbox("Unité de temps", list(INTERVALS.keys()), index=list(INTERVALS.keys()).index(timeframe), key="bt_timeframe")
+    with b2:
+        bt_count = st.slider("Nombre de bougies à tester", min_value=100, max_value=1500, value=500, step=100)
+    with b3:
+        bt_rr = st.selectbox("Objectif rendement/risque", [1.0, 1.5, 2.0, 3.0], index=2)
+    bt_strategy = st.selectbox("Stratégie à tester", ["SMC (sweep + structure + impulsion)", "EMA20/EMA50"], key="bt_strategy")
+    bt_oos_pct = st.slider("Partie réservée au test final hors échantillon (%)", min_value=20, max_value=50, value=30, step=5, key="bt_oos_pct", help="Les premiers trades servent de période de développement; la partie finale sert de vérification séparée.")
+    b4, b5 = st.columns(2)
+    with b4:
+        bt_cost_r = st.number_input(
+            "Coût estimé aller-retour (en R)", min_value=0.0, max_value=0.50,
+            value=0.02, step=0.01, key="bt_cost_r",
+            help="Estimation combinée spread, commission et slippage exprimée en multiples du risque initial. Exemple : 0,02 R."
+        )
+    with b5:
+        bt_initial_equity = st.number_input(
+            "Capital de départ (unités monétaires)", min_value=1.0, value=1000.0,
+            step=100.0, key="bt_initial_equity",
+            help="Utilisé pour illustrer une courbe de capital avec risque fixe par trade."
+        )
+    bt_risk_pct = st.slider(
+        "Risque simulé par trade (% du capital courant)", min_value=0.1, max_value=3.0,
+        value=1.0, step=0.1, key="bt_risk_pct"
+    )
+
+    if st.button("Lancer le backtest", type="primary", key="run_backtest"):
+        with st.spinner("Préparation des données et simulation..."):
+            bt_data = fetch_candles(SYMBOLS[market_name], bt_timeframe, bt_count)
+            if bt_data is None or len(bt_data) < 60:
+                st.error("Données insuffisantes pour ce marché et cette unité de temps. Essaie une autre unité.")
+            else:
+                bt = calculate_indicators(bt_data.copy()).reset_index(drop=True)
+                needed = ["open", "high", "low", "close", "ema_20", "ema_50", "atr"]
+                bt = bt.dropna(subset=needed).reset_index(drop=True)
+                trades = []
+                i = 1
+                while i < len(bt) - 1:
+                    prev = bt.iloc[i - 1]
+                    cur = bt.iloc[i]
+                    if not np.isfinite(cur["atr"]) or cur["atr"] <= 0:
+                        i += 1
+                        continue
+                    entry_i = i + 1
+                    side = None
+                    if bt_strategy == "EMA20/EMA50":
+                        cross_up = prev["ema_20"] <= prev["ema_50"] and cur["ema_20"] > cur["ema_50"]
+                        cross_down = prev["ema_20"] >= prev["ema_50"] and cur["ema_20"] < cur["ema_50"]
+                        if cross_up:
+                            side = "ACHAT"
+                        elif cross_down:
+                            side = "VENTE"
+                        if side is None:
+                            i += 1
+                            continue
+                        entry = float(bt.iloc[entry_i]["open"])
+                        risk_dist = float(cur["atr"])
+                        sl = entry - risk_dist if side == "ACHAT" else entry + risk_dist
+                    else:
+                        # Le setup est calculé uniquement sur les bougies jusqu'à i.
+                        history = bt.iloc[:i + 1].copy()
+                        setup = _find_confirmed_smc_setup(history, float(cur["atr"]))
+                        if setup.get("direction") not in ("Haussier", "Baissier"):
+                            i += 1
+                            continue
+                        side = "ACHAT" if setup["direction"] == "Haussier" else "VENTE"
+                        entry = float(bt.iloc[entry_i]["open"])
+                        sweep_extreme = float(setup["sweep_extreme"])
+                        sl = sweep_extreme - 0.2 * float(cur["atr"]) if side == "ACHAT" else sweep_extreme + 0.2 * float(cur["atr"])
+                        risk_dist = entry - sl if side == "ACHAT" else sl - entry
+                        if not np.isfinite(risk_dist) or risk_dist <= 0 or risk_dist > 2.5 * float(cur["atr"]):
+                            i += 1
+                            continue
+                    tp = entry + risk_dist * float(bt_rr) if side == "ACHAT" else entry - risk_dist * float(bt_rr)
+                    outcome = "OUVERT"
+                    exit_price = float(bt.iloc[-1]["close"])
+                    exit_time = bt.iloc[-1]["time"]
+                    exit_i = len(bt) - 1
+                    for j in range(entry_i, len(bt)):
+                        candle = bt.iloc[j]
+                        if side == "ACHAT":
+                            hit_sl = float(candle["low"]) <= sl
+                            hit_tp = float(candle["high"]) >= tp
+                        else:
+                            hit_sl = float(candle["high"]) >= sl
+                            hit_tp = float(candle["low"]) <= tp
+                        if hit_sl and hit_tp:
+                            outcome = "AMBIGU — exclu"
+                            exit_price = float(candle["close"])
+                            exit_time = candle["time"]
+                            exit_i = j
+                            break
+                        if hit_sl:
+                            outcome, exit_price, exit_time, exit_i = "PERDANT", sl, candle["time"], j
+                            break
+                        if hit_tp:
+                            outcome, exit_price, exit_time, exit_i = "GAGNANT", tp, candle["time"], j
+                            break
+                    if outcome == "GAGNANT":
+                        gross_r = float(bt_rr)
+                    elif outcome == "PERDANT":
+                        gross_r = -1.0
+                    elif outcome == "OUVERT":
+                        raw_move = (exit_price - entry) if side == "ACHAT" else (entry - exit_price)
+                        gross_r = raw_move / risk_dist
+                    else:
+                        gross_r = np.nan
+                    # Les coûts sont retranchés des résultats simulés, mais ne modifient pas les prix de déclenchement.
+                    net_r_trade = gross_r - float(bt_cost_r) if np.isfinite(gross_r) else np.nan
+                    trades.append({
+                        "Entrée": bt.iloc[entry_i]["time"], "Sens": side,
+                        "Prix entrée": entry, "SL": sl, "TP": tp,
+                        "Sortie": exit_time, "Résultat": outcome,
+                        "Bougies détenues": int(exit_i - entry_i + 1),
+                        "Stratégie": bt_strategy,
+                        "R brut": gross_r, "Coût estimé (R)": float(bt_cost_r),
+                        "R net estimé": net_r_trade,
+                    })
+                    i = max(entry_i + 1, exit_i + 1)
+
+                if not trades:
+                    st.info("Aucun croisement EMA exploitable n'a été trouvé sur la période chargée.")
+                else:
+                    results = pd.DataFrame(trades)
+                    resolved = results[results["Résultat"].isin(["GAGNANT", "PERDANT"])]
+                    wins = int((resolved["Résultat"] == "GAGNANT").sum())
+                    losses = int((resolved["Résultat"] == "PERDANT").sum())
+                    ambiguous = int((results["Résultat"] == "AMBIGU — exclu").sum())
+                    unresolved = int((results["Résultat"] == "OUVERT").sum())
+                    closed_count = wins + losses
+                    win_rate = (wins / closed_count * 100) if closed_count else 0.0
+                    net_r = float(resolved["R net estimé"].sum()) if not resolved.empty else 0.0
+                    gross_values = resolved["R brut"].astype(float) if not resolved.empty else pd.Series(dtype=float)
+                    net_values = resolved["R net estimé"].astype(float) if not resolved.empty else pd.Series(dtype=float)
+                    positive_sum = float(net_values[net_values > 0].sum()) if not net_values.empty else 0.0
+                    negative_sum = abs(float(net_values[net_values < 0].sum())) if not net_values.empty else 0.0
+                    profit_factor = positive_sum / negative_sum if negative_sum > 0 else np.nan
+                    expectancy_r = float(net_values.mean()) if not net_values.empty else 0.0
+
+                    # Courbe illustrative à risque fractionnel constant; seuls les trades classés sont inclus.
+                    equity = float(bt_initial_equity)
+                    peak = equity
+                    max_drawdown_pct = 0.0
+                    equity_rows = []
+                    for _, trade in resolved.iterrows():
+                        equity_before = equity
+                        risk_cash = equity_before * float(bt_risk_pct) / 100.0
+                        pnl_cash = risk_cash * float(trade["R net estimé"])
+                        equity = max(0.0, equity_before + pnl_cash)
+                        peak = max(peak, equity)
+                        dd = ((peak - equity) / peak * 100.0) if peak > 0 else 0.0
+                        max_drawdown_pct = max(max_drawdown_pct, dd)
+                        equity_rows.append({
+                            "Trade": len(equity_rows) + 1,
+                            "Entrée": trade["Entrée"],
+                            "Capital avant": equity_before,
+                            "Risque monétaire prévu": risk_cash,
+                            "Résultat net (R)": float(trade["R net estimé"]),
+                            "P&L estimé": pnl_cash,
+                            "Capital après": equity,
+                            "Drawdown (%)": dd,
+                        })
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Trades classés", closed_count)
+                    m2.metric("Taux de réussite", f"{win_rate:.1f}%")
+                    m3.metric("Résultat net estimé", f"{net_r:+.2f} R")
+                    m4.metric("Facteur de profit", f"{profit_factor:.2f}" if np.isfinite(profit_factor) else "N/D")
+                    m5, m6, m7, m8 = st.columns(4)
+                    m5.metric("Espérance par trade", f"{expectancy_r:+.3f} R")
+                    m6.metric("Drawdown max simulé", f"{max_drawdown_pct:.2f}%")
+                    m7.metric("Cas ambigus exclus", ambiguous)
+                    m8.metric("Trades non résolus", unresolved)
+                    if equity_rows:
+                        equity_df = pd.DataFrame(equity_rows)
+                        st.subheader("Courbe de capital simulée")
+                        st.line_chart(equity_df.set_index("Trade")["Capital après"])
+                        with st.expander("Détail du risque monétaire par trade"):
+                            st.dataframe(equity_df, use_container_width=True, hide_index=True)
+                            st.download_button(
+                                "Télécharger le journal de capital CSV",
+                                equity_df.to_csv(index=False).encode("utf-8-sig"),
+                                file_name="forexscope_journal_capital.csv",
+                                mime="text/csv",
+                                key="download_equity_journal",
+                            )
+                    # Vérification hors échantillon : les derniers trades chronologiques sont séparés du développement.
+                    # Les trades ambigus et ouverts ne contribuent pas aux métriques de performance.
+                    if not results.empty:
+                        ordered = results.sort_values("Entrée").reset_index(drop=True)
+                        split_at = max(1, int(len(ordered) * (1.0 - float(bt_oos_pct) / 100.0)))
+                        oos_all = ordered.iloc[split_at:].copy()
+                        oos = oos_all[oos_all["Résultat"].isin(["GAGNANT", "PERDANT"])]
+                        oos_wins = int((oos["Résultat"] == "GAGNANT").sum())
+                        oos_losses = int((oos["Résultat"] == "PERDANT").sum())
+                        oos_closed = oos_wins + oos_losses
+                        oos_rate = (oos_wins / oos_closed * 100.0) if oos_closed else 0.0
+                        oos_net = float(oos["R net estimé"].sum()) if not oos.empty else 0.0
+                        oos_mean = float(oos["R net estimé"].mean()) if not oos.empty else 0.0
+                        st.subheader("Vérification hors échantillon")
+                        st.caption(f"Les derniers {bt_oos_pct}% des signaux chronologiques sont réservés au test final. Ce découpage reste exploratoire et ne remplace pas une validation sur plusieurs périodes.")
+                        q1, q2, q3, q4 = st.columns(4)
+                        q1.metric("Trades classés hors échantillon", oos_closed)
+                        q2.metric("Taux de réussite hors échantillon", f"{oos_rate:.1f}%")
+                        q3.metric("Résultat net hors échantillon", f"{oos_net:+.2f} R")
+                        q4.metric("Espérance hors échantillon", f"{oos_mean:+.3f} R")
+                        if oos_closed < 20:
+                            st.info("Moins de 20 trades classés dans la partie hors échantillon : les statistiques sont trop limitées pour tirer une conclusion fiable.")
+                    st.dataframe(results, use_container_width=True, hide_index=True)
+                    csv_data = results.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button("Télécharger les résultats CSV", csv_data, file_name="forexscope_backtest.csv", mime="text/csv")
+                    st.warning(
+                        "Le backtest SMC applique une approximation mécanique du sweep, de la cassure et de l'impulsion; il n'intègre pas encore la confluence multi-timeframe H4/D1 ni la validation contextuelle complète des FVG/OB. "
+                        "Le coût aller-retour est une hypothèse saisie par l'utilisateur, exprimée en R; ce n'est pas une cotation réelle du courtier. "
+                        "Les prix d'exécution ne sont pas ajustés pour les coûts, et les trades ambigus (SL et TP dans la même bougie) sont exclus. "
+                        "La courbe de capital est illustrative, utilise un risque fractionnel fixe et ne prédit pas les performances futures. Le journal monétaire est une approximation en unités du capital, pas un calcul de lots MT5: la valeur du pip, la devise du compte, le contrat et les marges du courtier ne sont pas modélisés. Les trades non résolus sont affichés séparément et exclus des statistiques de performance."
+                    )
+
+    st.divider()
+    st.subheader("Comparaison des filtres SMC — avant / après phase 22")
+    st.caption(
+        "Compare le setup SMC mécanique avec et sans les filtres locaux EMA/RSI, éloignement EMA20 et ADX, "
+        "sur les mêmes données. Ce comparatif n'intègre pas la confluence H4/D1 du moteur en direct."
+    )
+    cf1, cf2, cf3 = st.columns(3)
+    with cf1:
+        compare_market = st.selectbox("Marché du comparatif", list(SYMBOLS.keys()), index=list(SYMBOLS.keys()).index(market_name), key="compare_filter_market")
+    with cf2:
+        compare_tf = st.selectbox("Unité du comparatif", list(INTERVALS.keys()), index=list(INTERVALS.keys()).index(bt_timeframe), key="compare_filter_tf")
+    with cf3:
+        compare_bars = st.slider("Bougies du comparatif", 100, 1500, 500, 100, key="compare_filter_bars")
+    if st.button("Comparer avant / après filtres", key="run_filter_comparison", type="secondary"):
+        with st.spinner("Comparaison des deux variantes sur les mêmes données..."):
+            compare_data = fetch_candles(SYMBOLS[compare_market], compare_tf, compare_bars)
+            if compare_data is None or len(compare_data) < 100:
+                st.error("Données insuffisantes pour ce marché et cette unité de temps.")
+            else:
+                comparison, comparison_details = run_smc_filter_comparison(compare_data, rr_value=float(bt_rr), cost_r=float(bt_cost_r))
+                st.dataframe(comparison, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Télécharger le résumé comparatif CSV",
+                    comparison.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="forexscope_comparaison_filtres_smc.csv", mime="text/csv",
+                    key="download_filter_comparison_summary"
+                )
+                for variant_name, variant_df in comparison_details.items():
+                    with st.expander(f"Détail des trades — {variant_name}"):
+                        if variant_df.empty:
+                            st.info("Aucun trade classé pour cette variante sur la période sélectionnée.")
+                        else:
+                            st.dataframe(variant_df, use_container_width=True, hide_index=True)
+                            st.download_button(
+                                f"Exporter les trades — {variant_name}",
+                                variant_df.to_csv(index=False).encode("utf-8-sig"),
+                                file_name=("forexscope_trades_smc_base.csv" if variant_name == "SMC de base" else "forexscope_trades_smc_filtres.csv"),
+                                mime="text/csv", key=f"download_{variant_name.replace(' ', '_').replace('+', 'plus')}_trades"
+                            )
+                st.warning(
+                    "Test historique expérimental : les trades ambigus (SL et TP touchés dans la même bougie) et les trades encore ouverts en fin de données sont maintenant comptés séparément, mais exclus du taux de réussite et du résultat net. "
+                    "Le filtre peut éliminer des trades gagnants comme perdants. Les résultats dépendent de la période et des coûts estimés; ce comparatif n'est pas le moteur live complet et ne prouve pas une rentabilité future."
+                )
+
+
+    st.divider()
+    st.subheader("Audit des rejets SMC et contrôle hors échantillon")
+    st.caption(
+        "Mesure quels filtres bloquent les setups candidats, puis compare les variantes sur la première partie de l’historique et sur les dernières bougies réservées. "
+        "Les catégories de rejet peuvent se chevaucher. Les calculs identiques sont conservés en cache pendant 5 minutes pour accélérer les relances."
+    )
+    au1, au2, au3 = st.columns(3)
+    with au1:
+        audit_market = st.selectbox("Marché de l’audit", list(SYMBOLS.keys()), index=list(SYMBOLS.keys()).index(market_name), key="audit_smc_market")
+    with au2:
+        audit_tf = st.selectbox("Unité de l’audit", list(INTERVALS.keys()), index=list(INTERVALS.keys()).index(bt_timeframe), key="audit_smc_tf")
+    with au3:
+        audit_bars = st.slider("Bougies de l’audit", 200, 1500, 800, 100, key="audit_smc_bars")
+    audit_holdout_pct = st.select_slider("Partie finale réservée au contrôle", options=[20, 25, 30, 35], value=30, key="audit_smc_holdout_pct")
+    if st.button("Analyser les rejets et le test final", key="run_smc_rejection_audit", type="secondary"):
+        with st.spinner("Analyse des filtres et séparation chronologique des données..."):
+            audit_data = fetch_candles(SYMBOLS[audit_market], audit_tf, audit_bars)
+            if audit_data is None or len(audit_data) < 200:
+                st.error("Données insuffisantes pour cet audit. Choisis une autre unité ou demande davantage de bougies.")
+            else:
+                audit_summary, audit_examples = run_smc_filter_rejection_audit(audit_data)
+                st.markdown("#### Pourquoi les setups sont-ils rejetés ?")
+                st.dataframe(audit_summary, use_container_width=True, hide_index=True)
+                if audit_examples.empty:
+                    st.info("Aucun setup candidat détecté sur la période sélectionnée.")
+                else:
+                    with st.expander("Afficher les setups examinés"):
+                        st.dataframe(audit_examples, use_container_width=True, hide_index=True)
+                        st.download_button("Exporter l’audit des setups CSV", audit_examples.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_audit_rejets_smc.csv", mime="text/csv", key="download_smc_audit_examples")
+                split_at = int(len(audit_data) * (1.0 - float(audit_holdout_pct) / 100.0))
+                # Les deux segments sont analysés séparément pour éviter que les résultats du premier segment
+                # soient mélangés à ceux du test final. Chaque segment doit conserver assez de bougies.
+                development_data = audit_data.iloc[:split_at].copy()
+                holdout_data = audit_data.iloc[split_at:].copy()
+                if len(development_data) < 100 or len(holdout_data) < 80:
+                    st.warning("Un des segments est trop court pour fournir une comparaison utile.")
+                else:
+                    dev_summary, _ = run_smc_filter_comparison(development_data, rr_value=float(bt_rr), cost_r=float(bt_cost_r))
+                    hold_summary, _ = run_smc_filter_comparison(holdout_data, rr_value=float(bt_rr), cost_r=float(bt_cost_r))
+                    dev_summary = dev_summary.rename(columns={c: f"{c} — développement" for c in dev_summary.columns if c != "Variante"})
+                    hold_summary = hold_summary.rename(columns={c: f"{c} — test final" for c in hold_summary.columns if c != "Variante"})
+                    joined = dev_summary.merge(hold_summary, on="Variante", how="outer")
+                    st.markdown("#### Comparaison chronologique : développement / test final")
+                    st.dataframe(joined, use_container_width=True, hide_index=True)
+                    # A visible sample-size check helps prevent overinterpreting a handful of trades.
+                    test_trade_cols = [c for c in joined.columns if "Trades classés — test final" in c]
+                    if test_trade_cols:
+                        test_counts = pd.to_numeric(joined[test_trade_cols[0]], errors="coerce").fillna(0)
+                        max_test_trades = int(test_counts.max()) if not test_counts.empty else 0
+                        if max_test_trades < 30:
+                            st.warning(f"Échantillon test final faible : au maximum {max_test_trades} trades classés. Les statistiques sont très incertaines; vise idéalement plusieurs dizaines de trades et teste d’autres périodes.")
+                        else:
+                            st.info(f"Le test final contient jusqu’à {max_test_trades} trades classés selon la variante. Cela améliore la lecture de l’échantillon, sans garantir sa représentativité.")
+                    st.download_button("Exporter la comparaison hors échantillon CSV", joined.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_smc_holdout_comparison.csv", mime="text/csv", key="download_smc_holdout_comparison")
+                    st.warning(
+                        "Le segment final est séparé chronologiquement, mais ce test reste exploratoire : le moteur SMC est une approximation mécanique, "
+                        "les coûts sont estimés et les petits échantillons sont peu fiables. Les filtres sont comptés de façon non exclusive; un setup peut échouer à plusieurs contrôles."
+                    )
+
+    st.divider()
+    st.subheader("Stabilité chronologique des filtres SMC")
+    st.caption("Découpe les bougies en périodes successives et compare le SMC de base aux filtres de la phase 22 sur chaque segment. Chaque période est évaluée séparément; ce contrôle reste expérimental.")
+    wf1, wf2, wf3 = st.columns(3)
+    with wf1:
+        wf_market = st.selectbox("Marché du test chronologique", list(SYMBOLS.keys()), index=list(SYMBOLS.keys()).index(market_name), key="wf_market")
+    with wf2:
+        wf_tf = st.selectbox("Unité du test chronologique", list(INTERVALS.keys()), index=list(INTERVALS.keys()).index(bt_timeframe), key="wf_tf")
+    with wf3:
+        wf_bars = st.slider("Bougies du test chronologique", 300, 1500, 900, 100, key="wf_bars")
+    wf_folds = st.select_slider("Nombre de périodes successives", options=[3, 4, 5], value=3, key="wf_folds")
+    if st.button("Tester la stabilité chronologique", key="run_smc_walk_forward", type="secondary"):
+        with st.spinner("Test des périodes successives..."):
+            wf_data = fetch_candles(SYMBOLS[wf_market], wf_tf, wf_bars)
+            if wf_data is None or len(wf_data) < wf_folds * 100:
+                st.error("Données insuffisantes. Augmente le nombre de bougies ou choisis une autre unité de temps.")
+            else:
+                wf_summary, wf_details = run_smc_walk_forward(wf_data, folds=wf_folds, rr_value=float(bt_rr), cost_r=float(bt_cost_r))
+                if wf_summary.empty:
+                    st.warning("Aucune période exploitable n'a produit de résumé.")
+                else:
+                    st.dataframe(wf_summary, use_container_width=True, hide_index=True)
+                    st.download_button("Télécharger le résumé chronologique CSV", wf_summary.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_stabilite_chronologique.csv", mime="text/csv", key="download_wf_summary")
+                    for label, trades_df in wf_details.items():
+                        with st.expander(label):
+                            if trades_df.empty:
+                                st.info("Aucun trade classé dans cette période.")
+                            else:
+                                st.dataframe(trades_df, use_container_width=True, hide_index=True)
+                                st.download_button(f"Exporter {label}", trades_df.to_csv(index=False).encode("utf-8-sig"), file_name=f"forexscope_{label.lower().replace(' ', '_').replace('—', '-')}.csv", mime="text/csv", key=f"download_{label.replace(' ', '_').replace('—', '_')}")
+                    st.warning("Chaque période est testée indépendamment avec un échauffement d'indicateurs propre. Le découpage ne corrige pas tous les biais de sélection, et l'approximation SMC ne comprend pas toute la confluence H4/D1 du moteur live. Les résultats ne garantissent pas les performances futures.")
+
+    st.divider()
+    st.subheader("Test de robustesse multi-marchés et multi-unités")
+    st.caption(
+        "Compare une stratégie EMA20/EMA50 ou l’approximation SMC sur plusieurs marchés et unités de temps. "
+        "Le rapport ajoute une vérification chronologique indicative sur les derniers 30 % des trades classés."
+    )
+    robust_strategy = st.selectbox(
+        "Stratégie du test de robustesse",
+        ["SMC (sweep + structure + impulsion)", "EMA20/EMA50"],
+        key="robust_strategy",
+    )
+    rb1, rb2 = st.columns(2)
+    with rb1:
+        robust_markets = st.multiselect(
+            "Marchés à comparer", options=list(SYMBOLS.keys()),
+            default=["EUR/USD", "GBP/USD", "Or (Gold)"] if all(x in SYMBOLS for x in ["EUR/USD", "GBP/USD", "Or (Gold)"]) else list(SYMBOLS.keys())[:3],
+            key="robust_markets",
+        )
+    with rb2:
+        robust_timeframes = st.multiselect(
+            "Unités de temps à comparer", options=list(INTERVALS.keys()),
+            default=["M15", "H1", "H4", "D1"], key="robust_timeframes",
+        )
+    rr1, rr2, rr3 = st.columns(3)
+    with rr1:
+        robust_bars = st.slider("Bougies par combinaison", 100, 1000, 300, 100, key="robust_bars")
+    with rr2:
+        robust_rr = st.selectbox("Ratio R:R du test comparatif", [1.0, 1.5, 2.0, 3.0], index=2, key="robust_rr")
+    with rr3:
+        robust_cost = st.number_input("Coût estimé par trade (R)", min_value=0.0, max_value=0.50, value=0.02, step=0.01, key="robust_cost")
+
+    if st.button("Lancer le test de robustesse", type="secondary", key="run_robustness"):
+        if not robust_markets or not robust_timeframes:
+            st.warning("Sélectionne au moins un marché et une unité de temps.")
+        else:
+            summary_rows = []
+            detail_rows = []
+            progress = st.progress(0)
+            combinations = [(m, tf) for m in robust_markets for tf in robust_timeframes]
+            for combo_index, (robust_market, robust_tf) in enumerate(combinations):
+                try:
+                    raw = fetch_candles(SYMBOLS[robust_market], robust_tf, robust_bars)
+                    if raw is None or len(raw) < 60:
+                        summary_rows.append({"Marché": robust_market, "Unité": robust_tf, "Trades classés": 0, "Taux réussite (%)": np.nan, "Résultat net (R)": 0.0, "Espérance (R)": np.nan, "Statut": "Données insuffisantes"})
+                        progress.progress((combo_index + 1) / len(combinations))
+                        continue
+                    frame = calculate_indicators(raw.copy()).reset_index(drop=True)
+                    frame = frame.dropna(subset=["open", "high", "low", "close", "ema_20", "ema_50", "atr"]).reset_index(drop=True)
+                    combo_trades = []
+                    i = 1
+                    while i < len(frame) - 1:
+                        prev, cur = frame.iloc[i - 1], frame.iloc[i]
+                        if not np.isfinite(cur["atr"]) or cur["atr"] <= 0:
+                            i += 1
+                            continue
+                        entry_i = i + 1
+                        entry = float(frame.iloc[entry_i]["open"])
+                        if robust_strategy == "EMA20/EMA50":
+                            up = prev["ema_20"] <= prev["ema_50"] and cur["ema_20"] > cur["ema_50"]
+                            down = prev["ema_20"] >= prev["ema_50"] and cur["ema_20"] < cur["ema_50"]
+                            if not (up or down):
+                                i += 1
+                                continue
+                            side = "ACHAT" if up else "VENTE"
+                            dist = float(cur["atr"])
+                            sl = entry - dist if side == "ACHAT" else entry + dist
+                        else:
+                            setup = _find_confirmed_smc_setup(frame.iloc[:i + 1].copy(), float(cur["atr"]))
+                            if setup.get("direction") not in ("Haussier", "Baissier"):
+                                i += 1
+                                continue
+                            side = "ACHAT" if setup["direction"] == "Haussier" else "VENTE"
+                            sweep_extreme = float(setup["sweep_extreme"])
+                            sl = sweep_extreme - 0.2 * float(cur["atr"]) if side == "ACHAT" else sweep_extreme + 0.2 * float(cur["atr"])
+                            dist = entry - sl if side == "ACHAT" else sl - entry
+                            if not np.isfinite(dist) or dist <= 0 or dist > 2.5 * float(cur["atr"]):
+                                i += 1
+                                continue
+                        tp = entry + dist * float(robust_rr) if side == "ACHAT" else entry - dist * float(robust_rr)
+                        outcome = "OUVERT"
+                        exit_i = len(frame) - 1
+                        gross_r = ((float(frame.iloc[-1]["close"]) - entry) if side == "ACHAT" else (entry - float(frame.iloc[-1]["close"]))) / dist
+                        for j in range(entry_i, len(frame)):
+                            candle = frame.iloc[j]
+                            hit_sl = float(candle["low"]) <= sl if side == "ACHAT" else float(candle["high"]) >= sl
+                            hit_tp = float(candle["high"]) >= tp if side == "ACHAT" else float(candle["low"]) <= tp
+                            if hit_sl and hit_tp:
+                                outcome = "AMBIGU"
+                                exit_i = j
+                                gross_r = np.nan
+                                break
+                            if hit_sl:
+                                outcome, exit_i, gross_r = "PERDANT", j, -1.0
+                                break
+                            if hit_tp:
+                                outcome, exit_i, gross_r = "GAGNANT", j, float(robust_rr)
+                                break
+                        if outcome in ("GAGNANT", "PERDANT"):
+                            net_r_trade = gross_r - float(robust_cost)
+                            combo_trades.append({"Marché": robust_market, "Unité": robust_tf, "Entrée": frame.iloc[entry_i]["time"], "Sens": side, "Résultat": outcome, "R net estimé": net_r_trade, "Bougies détenues": int(exit_i - entry_i + 1)})
+                        i = max(entry_i + 1, exit_i + 1)
+                    detail_rows.extend(combo_trades)
+                    n = len(combo_trades)
+                    wins = sum(t["Résultat"] == "GAGNANT" for t in combo_trades)
+                    net_values = [float(t["R net estimé"]) for t in combo_trades]
+                    positive_values = [v for v in net_values if v > 0]
+                    negative_values = [v for v in net_values if v < 0]
+                    equity_r = np.cumsum(net_values) if net_values else np.array([])
+                    peak_r = np.maximum.accumulate(np.concatenate(([0.0], equity_r)))[1:] if len(equity_r) else np.array([])
+                    drawdown_r = peak_r - equity_r if len(equity_r) else np.array([])
+                    gross_profit_r = float(sum(positive_values))
+                    gross_loss_r = abs(float(sum(negative_values)))
+                    # Séparation chronologique des trades classés : premiers 70 % descriptifs,
+                    # derniers 30 % réservés à une vérification indicative.
+                    split_at = int(np.floor(n * 0.70))
+                    oos_values = net_values[split_at:] if n else []
+                    oos_results = combo_trades[split_at:] if n else []
+                    oos_n = len(oos_results)
+                    oos_wins = sum(t["Résultat"] == "GAGNANT" for t in oos_results)
+                    oos_net = float(sum(oos_values)) if oos_values else 0.0
+                    oos_expectancy = float(np.mean(oos_values)) if oos_values else np.nan
+                    summary_rows.append({
+                        "Marché": robust_market, "Unité": robust_tf, "Trades classés": n,
+                        "Taux réussite (%)": round(wins / n * 100, 1) if n else np.nan,
+                        "Résultat net (R)": round(sum(net_values), 3),
+                        "Espérance (R)": round(float(np.mean(net_values)), 3) if n else np.nan,
+                        "Facteur de profit": round(gross_profit_r / gross_loss_r, 3) if gross_loss_r > 0 else (np.inf if gross_profit_r > 0 else np.nan),
+                        "Drawdown max (R)": round(float(np.max(drawdown_r)), 3) if len(drawdown_r) else 0.0,
+                        "Gain moyen (R)": round(float(np.mean(positive_values)), 3) if positive_values else np.nan,
+                        "Perte moyenne (R)": round(float(np.mean(negative_values)), 3) if negative_values else np.nan,
+                        "Trades vérification 30%": oos_n,
+                        "Taux réussite vérification (%)": round(oos_wins / oos_n * 100, 1) if oos_n else np.nan,
+                        "Résultat vérification (R)": round(oos_net, 3),
+                                                " vérification (R)": round(oos_expectancy, 3) if np.isfinite(oos_expectancy) else np.nan,
+                        "Statut": "À examiner" if n >= 20 and oos_n >= 6 else "Échantillon faible" if n else "Aucun trade classé",
+                    })
+                except Exception as exc:
+                    summary_rows.append({"Marché": robust_market, "Unité": robust_tf, "Trades classés": 0, "Taux réussite (%)": np.nan, "Résultat net (R)": 0.0, "Espérance (R)": np.nan, "Statut": f"Erreur de données/calcul: {type(exc).__name__}"})
+                progress.progress((combo_index + 1) / len(combinations))
+            if summary_rows:
+                summary_df = pd.DataFrame(summary_rows)
+                st.subheader("Comparaison des résultats")
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                st.download_button("Télécharger le résumé CSV", summary_df.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_robustesse_resume.csv", mime="text/csv", key="download_robust_summary")
+                if detail_rows:
+                    detail_df = pd.DataFrame(detail_rows)
+                    st.download_button("Télécharger les trades comparatifs CSV", detail_df.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_robustesse_trades.csv", mime="text/csv", key="download_robust_trades")
+                st.warning(
+                    "Les métriques globales sont calculées sur les trades classés de chaque combinaison. Les colonnes de vérification utilisent les derniers 30 % des trades classés, dans l’ordre chronologique; il s’agit d’un contrôle indicatif et non d’une validation totalement indépendante, car la stratégie n’a pas été optimisée séparément sur une période d’entraînement. Le drawdown est exprimé en R cumulés, et non en pourcentage du capital. "
+                    "Les résultats peuvent varier selon la disponibilité et la qualité des données Yahoo Finance. "
+                    "Les frais sont une estimation en R; le spread réel, le slippage et les spécifications du contrat ne sont pas reproduits."
+                )
+
+
+
+    st.divider()
+    st.subheader("Analyse de sensibilité des paramètres")
+    st.caption(
+        "Compare plusieurs ratios rendement/risque et hypothèses de coûts sur le même marché, "
+        "la même unité de temps et la même stratégie. Ce test aide à repérer des résultats "
+        "trop dépendants d'un paramètre; il ne garantit pas la rentabilité."
+    )
+    ss1, ss2, ss3 = st.columns(3)
+    with ss1:
+        sens_market = st.selectbox("Marché de sensibilité", list(SYMBOLS.keys()), index=list(SYMBOLS.keys()).index(market_name) if market_name in SYMBOLS else 0, key="sens_market")
+    with ss2:
+        sens_tf = st.selectbox("Unité de temps de sensibilité", list(INTERVALS.keys()), index=list(INTERVALS.keys()).index(timeframe) if timeframe in INTERVALS else 0, key="sens_tf")
+    with ss3:
+        sens_strategy = st.selectbox("Stratégie de sensibilité", ["SMC (sweep + structure + impulsion)", "EMA20/EMA50"], key="sens_strategy")
+    ss4, ss5 = st.columns(2)
+    with ss4:
+        sens_bars = st.slider("Bougies de sensibilité", 100, 1500, 500, 100, key="sens_bars")
+    with ss5:
+        sens_costs = st.multiselect("Coûts à comparer (R)", [0.00, 0.01, 0.02, 0.05, 0.10], default=[0.00, 0.02, 0.05], key="sens_costs")
+    sens_rrs = st.multiselect("Ratios rendement/risque à comparer", [1.0, 1.5, 2.0, 2.5, 3.0], default=[1.0, 1.5, 2.0, 3.0], key="sens_rrs")
+    if st.button("Lancer l'analyse de sensibilité", key="run_sensitivity", type="secondary"):
+        if not sens_costs or not sens_rrs:
+            st.warning("Sélectionne au moins un coût et un ratio R:R.")
+        else:
+            with st.spinner("Test des combinaisons de paramètres..."):
+                sens_raw = fetch_candles(SYMBOLS[sens_market], sens_tf, sens_bars)
+                if sens_raw is None or len(sens_raw) < 60:
+                    st.error("Données insuffisantes pour cette combinaison marché/unité de temps.")
+                else:
+                    sens_rows = []
+                    sens_details = []
+                    base_strategy = "EMA20/EMA50" if sens_strategy == "EMA20/EMA50" else "SMC"
+                    for rr_value in sens_rrs:
+                        for cost_value in sens_costs:
+                            try:
+                                test_trades = run_sensitivity_backtest(sens_raw, base_strategy, rr_value, cost_value)
+                                values = [float(t["R net estimé"]) for t in test_trades]
+                                wins = sum(t["Résultat"] == "GAGNANT" for t in test_trades)
+                                losses = sum(t["Résultat"] == "PERDANT" for t in test_trades)
+                                n = len(test_trades)
+                                gross_wins = sum(max(v, 0.0) for v in values)
+                                gross_losses = abs(sum(min(v, 0.0) for v in values))
+                                equity = np.cumsum(values) if values else np.array([])
+                                peaks = np.maximum.accumulate(np.concatenate(([0.0], equity)))[1:] if len(equity) else np.array([])
+                                dd = peaks - equity if len(equity) else np.array([])
+                                sens_rows.append({
+                                    "Marché": sens_market, "Unité": sens_tf, "Stratégie": sens_strategy,
+                                    "R:R": float(rr_value), "Coût (R)": float(cost_value), "Trades classés": n,
+                                    "Taux réussite (%)": round(wins / n * 100, 1) if n else np.nan,
+                                    "Résultat net (R)": round(sum(values), 3),
+                                    "Espérance (R)": round(float(np.mean(values)), 3) if values else np.nan,
+                                    "Facteur de profit": round(gross_wins / gross_losses, 3) if gross_losses > 0 else (np.inf if gross_wins > 0 else np.nan),
+                                    "Drawdown max (R)": round(float(np.max(dd)), 3) if len(dd) else 0.0,
+                                    "Statut": "À examiner" if n >= 20 else "Échantillon faible",
+                                })
+                                for trade in test_trades:
+                                    sens_details.append({"R:R": rr_value, "Coût (R)": cost_value, **trade})
+                            except Exception as exc:
+                                sens_rows.append({"Marché": sens_market, "Unité": sens_tf, "Stratégie": sens_strategy, "R:R": rr_value, "Coût (R)": cost_value, "Trades classés": 0, "Statut": f"Erreur: {type(exc).__name__}"})
+                    sens_df = pd.DataFrame(sens_rows)
+                    st.dataframe(sens_df, use_container_width=True, hide_index=True)
+                    st.download_button("Télécharger le rapport de sensibilité CSV", sens_df.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_sensibilite.csv", mime="text/csv", key="download_sensitivity_summary")
+                    if sens_details:
+                        st.download_button("Télécharger les trades de sensibilité CSV", pd.DataFrame(sens_details).to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_sensibilite_trades.csv", mime="text/csv", key="download_sensitivity_trades")
+                    st.warning("Les résultats sont des simulations historiques. Les coûts sont déduits en R, mais ne modifient pas les prix de déclenchement; les trades ambigus où SL et TP sont touchés dans la même bougie sont exclus. Les résultats ne reproduisent pas parfaitement le courtier ni la confluence multi-unités complète du moteur SMC. Évite de choisir un paramètre uniquement parce qu'il a le meilleur résultat sur cet historique.")
+
+
+    st.divider()
+    st.subheader("Simulation Monte-Carlo des résultats")
+    st.caption(
+        "Cette simulation réordonne aléatoirement les résultats R des trades historiques classés pour illustrer l'incertitude liée à leur séquence. "
+        "Elle ne prédit pas les marchés et ne remplace pas un backtest hors échantillon."
+    )
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        mc_market = st.selectbox("Marché Monte-Carlo", list(SYMBOLS.keys()), index=list(SYMBOLS.keys()).index(market_name) if market_name in SYMBOLS else 0, key="mc_market")
+    with mc2:
+        mc_tf = st.selectbox("Unité Monte-Carlo", list(INTERVALS.keys()), index=list(INTERVALS.keys()).index(timeframe) if timeframe in INTERVALS else 0, key="mc_tf")
+    with mc3:
+        mc_strategy_label = st.selectbox("Stratégie Monte-Carlo", ["SMC (sweep + structure + impulsion)", "EMA20/EMA50"], key="mc_strategy")
+    mc4, mc5, mc6 = st.columns(3)
+    with mc4:
+        mc_bars = st.slider("Bougies Monte-Carlo", 100, 1500, 500, 100, key="mc_bars")
+    with mc5:
+        mc_rr = st.selectbox("Ratio R:R Monte-Carlo", [1.0, 1.5, 2.0, 2.5, 3.0], index=2, key="mc_rr")
+    with mc6:
+        mc_cost = st.selectbox("Coût estimé par trade (R)", [0.00, 0.01, 0.02, 0.05, 0.10], index=2, key="mc_cost")
+    mc_runs = st.select_slider("Nombre de simulations", options=[250, 500, 1000, 2000], value=1000, key="mc_runs")
+    if st.button("Lancer la simulation Monte-Carlo", key="run_monte_carlo", type="secondary"):
+        with st.spinner("Calcul des trades historiques puis des séquences simulées..."):
+            mc_raw = fetch_candles(SYMBOLS[mc_market], mc_tf, mc_bars)
+            if mc_raw is None or len(mc_raw) < 60:
+                st.error("Données insuffisantes pour cette combinaison marché/unité de temps.")
+            else:
+                try:
+                    mc_strategy = "EMA20/EMA50" if mc_strategy_label == "EMA20/EMA50" else "SMC"
+                    mc_trades = run_sensitivity_backtest(mc_raw, mc_strategy, float(mc_rr), float(mc_cost))
+                    mc_values = np.asarray([float(t["R net estimé"]) for t in mc_trades if np.isfinite(float(t["R net estimé"]))], dtype=float)
+                    if len(mc_values) < 10:
+                        st.warning(f"Seulement {len(mc_values)} trades classés. Il faut au moins 10 pour lancer une simulation indicative; idéalement, utilise un échantillon bien plus grand.")
+                    else:
+                        rng = np.random.default_rng(42)
+                        final_results = np.empty(int(mc_runs), dtype=float)
+                        max_drawdowns = np.empty(int(mc_runs), dtype=float)
+                        for run_idx in range(int(mc_runs)):
+                            sequence = rng.permutation(mc_values)
+                            equity = np.cumsum(sequence)
+                            peaks = np.maximum.accumulate(np.concatenate(([0.0], equity)))[1:]
+                            drawdown = peaks - equity
+                            final_results[run_idx] = equity[-1]
+                            max_drawdowns[run_idx] = float(np.max(drawdown)) if len(drawdown) else 0.0
+                        mc_summary = pd.DataFrame([
+                            {"Indicateur": "Trades historiques classés", "Valeur": int(len(mc_values))},
+                            {"Indicateur": "Résultat observé (R)", "Valeur": round(float(np.sum(mc_values)), 3)},
+                            {"Indicateur": "Résultat final P5 (R)", "Valeur": round(float(np.percentile(final_results, 5)), 3)},
+                            {"Indicateur": "Résultat final médian (R)", "Valeur": round(float(np.percentile(final_results, 50)), 3)},
+                            {"Indicateur": "Résultat final P95 (R)", "Valeur": round(float(np.percentile(final_results, 95)), 3)},
+                            {"Indicateur": "Probabilité simulée de finir sous 0 (%)", "Valeur": round(float(np.mean(final_results < 0) * 100), 1)},
+                            {"Indicateur": "Drawdown maximal médian (R)", "Valeur": round(float(np.percentile(max_drawdowns, 50)), 3)},
+                            {"Indicateur": "Drawdown maximal P95 (R)", "Valeur": round(float(np.percentile(max_drawdowns, 95)), 3)},
+                        ])
+                        st.dataframe(mc_summary, use_container_width=True, hide_index=True)
+                        chart_df = pd.DataFrame({"Résultat final (R)": final_results})
+                        st.line_chart(chart_df.sort_values("Résultat final (R)").reset_index(drop=True), use_container_width=True)
+                        st.download_button("Télécharger le résumé Monte-Carlo CSV", mc_summary.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_monte_carlo_resume.csv", mime="text/csv", key="download_mc_summary")
+                        st.download_button("Télécharger les résultats simulés CSV", pd.DataFrame({"Résultat final (R)": final_results, "Drawdown maximal (R)": max_drawdowns}).to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_monte_carlo_simulations.csv", mime="text/csv", key="download_mc_runs")
+                        st.warning("La simulation conserve les mêmes résultats de trades et ne fait que mélanger leur ordre. Elle suppose donc que les résultats sont interchangeables et ne modélise ni changement de marché, ni dépendance entre trades, ni coûts réels du courtier. Les percentiles sont des scénarios simulés, pas des probabilités fiables de performance future.")
+                except Exception as exc:
+                    st.error(f"La simulation n'a pas pu être calculée : {type(exc).__name__}. Vérifie les données et réessaie.")
+
+
+    st.divider()
+    st.subheader("Robustesse SMC sur plusieurs marchés")
+    st.caption(
+        "Compare les mêmes règles SMC sur plusieurs instruments avec la même unité de temps, le même objectif rendement/risque et les mêmes coûts estimés. "
+        "Ce test aide à repérer une stratégie qui ne fonctionne que sur un seul marché; il ne constitue pas une optimisation automatique."
+    )
+    robust_markets = st.multiselect(
+        "Marchés à comparer",
+        options=list(SYMBOLS.keys()),
+        default=[name for name in ["EUR/USD", "GBP/USD", "USD/JPY", "Or (XAU/USD)", "Bitcoin (BTC/USD)"] if name in SYMBOLS],
+        key="smc_robust_markets",
+    )
+    rb1, rb2 = st.columns(2)
+    with rb1:
+        robust_tf = st.selectbox("Unité de temps de comparaison", list(INTERVALS.keys()), index=list(INTERVALS.keys()).index(bt_timeframe), key="smc_robust_tf")
+    with rb2:
+        robust_bars = st.slider("Bougies par marché", min_value=200, max_value=1500, value=500, step=100, key="smc_robust_bars")
+    if st.button("Lancer la comparaison multi-marchés", key="run_smc_multi_market_robustness", type="secondary"):
+        if len(robust_markets) < 2:
+            st.warning("Sélectionne au moins deux marchés pour comparer la robustesse.")
+        else:
+            robustness_rows = []
+            robustness_details = {}
+            progress = st.progress(0, text="Préparation des marchés...")
+            for market_index, selected_market in enumerate(robust_markets):
+                try:
+                    market_data = fetch_candles(SYMBOLS[selected_market], robust_tf, robust_bars)
+                    if market_data is None or len(market_data) < 100:
+                        robustness_rows.append({"Marché": selected_market, "Bougies disponibles": 0 if market_data is None else len(market_data), "Variante": "SMC de base", "Trades classés": 0, "Taux de réussite (%)": np.nan, "Résultat net estimé (R)": np.nan, "Espérance (R/trade)": np.nan, "Facteur de profit": np.nan, "Statut": "Données insuffisantes"})
+                    else:
+                        market_summary, market_trade_details = run_smc_filter_comparison(market_data, rr_value=float(bt_rr), cost_r=float(bt_cost_r))
+                        for _, row in market_summary.iterrows():
+                            row_dict = row.to_dict()
+                            robustness_rows.append({
+                                "Marché": selected_market,
+                                "Bougies disponibles": len(market_data),
+                                "Variante": row_dict.get("Variante", "Inconnue"),
+                                "Trades classés": row_dict.get("Trades classés", 0),
+                                "Taux de réussite (%)": row_dict.get("Taux de réussite (%)", np.nan),
+                                "Résultat net estimé (R)": row_dict.get("Résultat net estimé (R)", np.nan),
+                                "Espérance (R/trade)": row_dict.get("Espérance (R/trade)", np.nan),
+                                "Facteur de profit": row_dict.get("Facteur de profit", np.nan),
+                                "Statut": "Échantillon faible" if int(row_dict.get("Trades classés", 0) or 0) < 30 else "À examiner",
+                            })
+                            for variant, trades_df in market_trade_details.items():
+                                robustness_details[f"{selected_market} — {variant}"] = trades_df.copy()
+                except Exception as exc:
+                    robustness_rows.append({"Marché": selected_market, "Bougies disponibles": 0, "Variante": "—", "Trades classés": 0, "Taux de réussite (%)": np.nan, "Résultat net estimé (R)": np.nan, "Espérance (R/trade)": np.nan, "Facteur de profit": np.nan, "Statut": f"Erreur : {type(exc).__name__}"})
+                progress.progress((market_index + 1) / len(robust_markets), text=f"Marché analysé : {selected_market}")
+            progress.empty()
+            robustness_df = pd.DataFrame(robustness_rows)
+            if not robustness_df.empty:
+                st.dataframe(robustness_df, use_container_width=True, hide_index=True)
+                st.markdown("#### Incertitude de l'espérance par marché")
+                ci_rows = []
+                for detail_name, detail_df in robustness_details.items():
+                    ci = bootstrap_expectancy_interval(detail_df, iterations=1000, seed=42)
+                    market_part, _, variant_part = detail_name.partition(" — ")
+                    ci_rows.append({"Marché": market_part, "Variante": variant_part, **ci})
+                if ci_rows:
+                    ci_df = pd.DataFrame(ci_rows)
+                    st.dataframe(ci_df, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "Exporter les intervalles d'espérance CSV",
+                        ci_df.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="forexscope_intervalles_es esperance.csv".replace(" ", "_"),
+                        mime="text/csv",
+                        key="download_smc_expectancy_intervals",
+                    )
+                    st.caption("L'intervalle bootstrap rééchantillonne les trades classés. Il est indicatif : il ne modélise pas la dépendance temporelle, les changements de régime ni les coûts réels. Un intervalle recouvrant zéro ne permet pas d'affirmer que l'espérance est positive.")
+                st.download_button(
+                    "Exporter les résultats multi-marchés CSV",
+                    robustness_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="forexscope_robustesse_smc_multi_marches.csv",
+                    mime="text/csv",
+                    key="download_smc_multi_market_robustness",
+                )
+                with st.expander("Détails des trades par marché et variante"):
+                    for detail_name, detail_df in robustness_details.items():
+                        st.markdown(f"**{detail_name}**")
+                        if detail_df.empty:
+                            st.info("Aucun trade classé pour cette combinaison.")
+                        else:
+                            st.dataframe(detail_df, use_container_width=True, hide_index=True)
+                st.warning(
+                       "Les marchés peuvent avoir des historiques, spreads, horaires et qualités de données différents. "
+                    " coûts restent des estimations communes, les résultats sont issus d'une approximation mécanique du SMC et les échantillons de moins de 30 trades sont particulièrement incertains. "
+                    "Ne choisis pas un marché uniquement parce que son résultat historique est le meilleur."
+                )
+
+
+    st.divider()
+    st.subheader("Validation SMC par fenêtres chronologiques")
+    st.caption(
+        "Le test découpe l'historique en fenêtres successives et mesure la stabilité des règles SMC fixes. "
+        "Aucune optimisation n'est faite sur ces fenêtres; il s'agit d'un contrôle de stabilité, pas d'une garantie de rentabilité."
+    )
+    wf_market = st.selectbox("Marché pour la validation chronologique", list(SYMBOLS.keys()), index=list(SYMBOLS.keys()).index(market_name) if market_name in SYMBOLS else 0, key="smc_walkforward_market")
+    wf1, wf2 = st.columns(2)
+    with wf1:
+        wf_tf = st.selectbox("Unité de temps", list(INTERVALS.keys()), index=list(INTERVALS.keys()).index(bt_timeframe) if bt_timeframe in INTERVALS else 0, key="smc_walkforward_tf")
+    with wf2:
+        wf_windows = st.selectbox("Nombre de fenêtres chronologiques", [3, 4, 5, 6], index=1, key="smc_walkforward_windows")
+    wf_bars = st.slider("Historique total à découper", min_value=300, max_value=1500, value=800, step=100, key="smc_walkforward_bars")
+    if st.button("Lancer la validation chronologique", key="run_smc_walkforward", type="secondary"):
+        try:
+            with st.spinner("Analyse des fenêtres chronologiques..."):
+                wf_data = fetch_candles(SYMBOLS[wf_market], wf_tf, wf_bars)
+                if wf_data is None or len(wf_data) < wf_windows * 100:
+                    st.warning("Historique insuffisant pour créer des fenêtres d'au moins 100 bougies. Augmente l'historique ou réduis le nombre de fenêtres.")
+                else:
+                    wf_results, wf_details = run_smc_chronological_windows(wf_data, windows=wf_windows, rr_value=float(bt_rr), cost_r=float(bt_cost_r))
+                    if wf_results.empty:
+                        st.info("Aucun résultat disponible pour ces paramètres.")
+                    else:
+                        st.dataframe(wf_results, use_container_width=True, hide_index=True)
+                        stability_summary = summarize_smc_window_stability(wf_results)
+                        if not stability_summary.empty:
+                            st.markdown("#### Synthèse de stabilité par variante")
+                            st.dataframe(stability_summary, use_container_width=True, hide_index=True)
+                            st.caption("La synthèse décrit la dispersion entre fenêtres historiques. Elle ne constitue pas une estimation garantie des performances futures.")
+                        export_parts = [wf_results.assign(Type="Détail par fenêtre")]
+                        if not stability_summary.empty:
+                            export_parts.append(stability_summary.assign(Type="Synthèse de stabilité"))
+                        export_df = pd.concat(export_parts, ignore_index=True, sort=False)
+                        st.download_button("Exporter la validation chronologique CSV", export_df.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_validation_chronologique.csv", mime="text/csv", key="download_smc_walkforward")
+                        valid = wf_results.dropna(subset=["Espérance (R/trade)"]) if "Espérance (R/trade)" in wf_results.columns else pd.DataFrame()
+                        if not valid.empty:
+                            st.markdown("#### Espérance par fenêtre")
+                            chart_data = valid.pivot_table(index="Fenêtre", columns="Variante", values="Espérance (R/trade)", aggfunc="first")
+                            st.line_chart(chart_data, use_container_width=True)
+                        with st.expander("Détails des trades par fenêtre"):
+                            for detail_name, detail_df in wf_details.items():
+                                st.markdown(f"**{detail_name}**")
+                                if detail_df.empty:
+                                    st.info("Aucun trade classé dans cette fenêtre.")
+                                else:
+                                    st.dataframe(detail_df, use_container_width=True, hide_index=True)
+                        st.warning("Limites : chaque fenêtre réinitialise l'échauffement des indicateurs; les coûts restent estimés; les fenêtres peuvent contenir peu de trades. Cette procédure vérifie la stabilité chronologique des règles fixes, mais ce n'est pas un vrai walk-forward avec optimisation sur une période d'entraînement et test indépendant.")
+        except Exception as exc:
+            st.error(f"La validation chronologique a échoué : {type(exc).__name__}. Vérifie les données et réessaie.")
+
+
+with tab_settings:
+    st.subheader("Paramètres de données")
+    st.write("Fournisseur : Yahoo Finance")
+    st.write(f"Symbole Yahoo : {SYMBOLS[market_name]}")
+    st.write(f"Unité sélectionnée : {timeframe}")
+    st.write(f"Nombre de bougies demandé : {candle_count}")
+    st.warning(
+        "Les données peuvent être retardées, incomplètes ou indisponibles. "
+        "Les bougies H4 sont reconstruites à partir des bougies H1."
+    )
+    st.caption(
+        "Les FVG et Order Blocks affichés sont des zones candidates détectées "
+        "par des règles mécaniques. Ils doivent être validés par le contexte "
+        "et ne constituent pas, à eux seuls, un signal d'entrée."
+    )
+
+    st.divider()
+    st.subheader("Tests contrôlés du moteur SMC")
+    st.caption("Scénarios synthétiques reproductibles pour vérifier quelques comportements fondamentaux. Ces tests ne prouvent pas la rentabilité et ne couvrent pas toutes les branches du moteur.")
+    if st.button("Lancer les tests du moteur SMC", key="run_smc_engine_self_tests"):
+        self_test_report = run_smc_engine_self_tests()
+        st.dataframe(self_test_report, use_container_width=True, hide_index=True)
+        failed_tests = self_test_report[self_test_report["État"] == "ÉCHEC"]
+        if failed_tests.empty:
+            st.success(f"{len(self_test_report)} tests contrôlés réussis.")
+        else:
+            st.error(f"{len(failed_tests)} test(s) en échec. Vérifie les détails avant de poursuivre.")
+        st.download_button(
+            "Exporter les tests SMC CSV",
+            data=self_test_report.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forexscope_tests_smc.csv",
+            mime="text/csv",
+            key="download_smc_engine_self_tests",
+        )
+
+    st.divider()
+    st.subheader("Intégrité temporelle des signaux")
+    st.caption("Tests synthétiques vérifiant que l’analyse multi-timeframe utilise la dernière bougie clôturée et que l’horodatage correspond à cette bougie.")
+    if st.button("Tester l’intégrité temporelle", key="run_temporal_integrity_tests"):
+        temporal_report = run_smc_temporal_integrity_tests()
+        st.dataframe(temporal_report, use_container_width=True, hide_index=True)
+        temporal_failures = temporal_report[temporal_report["État"] == "ÉCHEC"]
+        if temporal_failures.empty:
+            st.success(f"{len(temporal_report)} tests temporels réussis.")
+        else:
+            st.error(f"{len(temporal_failures)} test(s) temporel(s) en échec. Ne considère pas les signaux comme validés.")
+        st.download_button(
+            "Exporter les tests temporels CSV",
+            data=temporal_report.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forexscope_tests_integrite_temporelle.csv",
+            mime="text/csv",
+            key="download_temporal_integrity_tests",
+        )
+
+
+    st.divider()
+    st.subheader("Cohérence multi-unités de temps")
+    st.caption("Compare les biais des unités courtes M5/M15 au contexte supérieur H4/D1. Cette vérification décrit l’alignement, elle ne crée pas à elle seule un signal de trading.")
+    if st.button("Analyser la cohérence MTF", key="run_mtf_consistency_audit"):
+        with st.spinner("Récupération et analyse des unités de temps…"):
+            mtf_audit_results = analyze_multiple_timeframes(SYMBOLS[market_name], candle_count)
+        mtf_report, mtf_state, mtf_summary = build_mtf_consistency_report(mtf_audit_results)
+        st.dataframe(mtf_report, use_container_width=True, hide_index=True)
+        if mtf_state == "ALIGNÉ":
+            st.success(mtf_summary)
+        elif mtf_state == "CONFLIT":
+            st.warning(mtf_summary)
+        else:
+            st.info(mtf_summary)
+        st.download_button(
+            "Exporter le rapport MTF CSV",
+            data=mtf_report.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forexscope_coherence_mtf.csv",
+            mime="text/csv",
+            key="download_mtf_consistency_audit",
+        )
+
+    st.divider()
+    st.subheader("Tests d’intégrité des données MTF")
+    st.caption("Vérifie les cas de données manquantes, d’horodatages invalides et de biais inconnus. Le contrôle de fraîcheur ci-dessus est indicatif et dépend du calendrier du marché.")
+    if st.button("Lancer les tests d’intégrité MTF", key="run_mtf_integrity_unit_tests"):
+        mtf_integrity_tests = run_mtf_integrity_unit_tests()
+        st.dataframe(mtf_integrity_tests, use_container_width=True, hide_index=True)
+        mtf_failed = mtf_integrity_tests[mtf_integrity_tests["État"] == "ÉCHEC"]
+        if mtf_failed.empty:
+            st.success(f"{len(mtf_integrity_tests)} tests d’intégrité MTF réussis.")
+        else:
+            st.error(f"{len(mtf_failed)} test(s) MTF en échec.")
+        st.download_button(
+            "Exporter les tests d’intégrité MTF CSV",
+            data=mtf_integrity_tests.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forexscope_tests_integrite_mtf.csv",
+            mime="text/csv",
+            key="download_mtf_integrity_unit_tests",
+        )
+
+    st.divider()
+    st.subheader("Validation stricte de la confluence MTF")
+    st.caption("Contrôle M5, M15, H4 et D1 ensemble. Une unité absente, périmée ou neutre empêche la validation complète. Ce statut n’est ni une probabilité de gain ni un signal d’achat/vente.")
+    if st.button("Évaluer la préparation MTF", key="run_mtf_readiness_gate"):
+        with st.spinner("Analyse des unités M5, M15, H4 et D1…"):
+            readiness_results = analyze_multiple_timeframes(SYMBOLS[market_name], candle_count)
+        readiness_report, readiness_state, readiness_summary, readiness_issues = assess_mtf_readiness(readiness_results)
+        st.dataframe(readiness_report, use_container_width=True, hide_index=True)
+        if readiness_state == "PRÊT POUR ÉVALUATION":
+            st.success(readiness_summary)
+        elif readiness_state == "CONFLIT DIRECTIONNEL":
+            st.warning(readiness_summary)
+        else:
+            st.info(readiness_summary)
+        if readiness_issues:
+            st.write("Points à vérifier :")
+            for issue in readiness_issues:
+                st.write(f"- {issue}")
+        st.download_button("Exporter le diagnostic de préparation MTF CSV", readiness_report.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_preparation_mtf.csv", mime="text/csv", key="download_mtf_readiness_gate")
+
+    if st.button("Tester la validation stricte MTF", key="run_mtf_readiness_tests"):
+        readiness_tests = run_mtf_readiness_tests()
+        st.dataframe(readiness_tests, use_container_width=True, hide_index=True)
+        readiness_failures = readiness_tests[readiness_tests["État"] == "ÉCHEC"]
+        if readiness_failures.empty:
+            st.success(f"{len(readiness_tests)} tests de préparation MTF réussis.")
+        else:
+            st.error(f"{len(readiness_failures)} test(s) de préparation MTF en échec.")
+        st.download_button("Exporter les tests de préparation MTF CSV", readiness_tests.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_tests_preparation_mtf.csv", mime="text/csv", key="download_mtf_readiness_tests")
+
+    st.divider()
+    st.subheader("Tests du blocage des signaux sur données périmées")
+    st.caption("Tests contrôlés du garde-fou : données fraîches, bougies périmées, contexte H4 manquant et horodatages absents.")
+    if st.button("Lancer les tests de fraîcheur des signaux", key="run_signal_freshness_guard_tests"):
+        freshness_tests = run_signal_freshness_guard_tests()
+        st.dataframe(freshness_tests, use_container_width=True, hide_index=True)
+        failed_freshness = freshness_tests[freshness_tests["État"] == "ÉCHEC"]
+        if failed_freshness.empty:
+            st.success(f"{len(freshness_tests)} tests de fraîcheur réussis.")
+        else:
+            st.error(f"{len(failed_freshness)} test(s) de fraîcheur en échec.")
+        st.download_button(
+            "Exporter les tests de fraîcheur CSV",
+            data=freshness_tests.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forexscope_tests_fraicheur_signaux.csv",
+            mime="text/csv",
+            key="download_signal_freshness_guard_tests",
+        )
+
+    st.divider()
+    st.subheader("Cohérence signal / historique — Phase 49")
+    st.info("Le contrôle avant enregistrement vérifie désormais aussi que le ratio rendement/risque déclaré correspond aux distances Entrée–SL et Entrée–TP. Le calcul de lots reste une estimation et dépend de la valeur du pip et du contrat fournis.")
+    st.caption("Vérifie l’ordre Entrée/SL/TP, le ratio rendement/risque annoncé et l’horodatage. Les nouveaux signaux ACHAT/VENTE incohérents sont refusés avant insertion dans SQLite.")
+    audit_col, test_col = st.columns(2)
+    with audit_col:
+        if st.button("Auditer l’historique des signaux", key="run_saved_signal_consistency_audit"):
+            saved_signal_audit = audit_saved_signal_consistency(limit=500)
+            st.dataframe(saved_signal_audit, use_container_width=True, hide_index=True)
+            bad_rows = saved_signal_audit[saved_signal_audit["État"] == "À CORRIGER"] if "État" in saved_signal_audit.columns else pd.DataFrame()
+            if bad_rows.empty and not (len(saved_signal_audit) == 1 and saved_signal_audit.iloc[0]["État"] == "À VÉRIFIER"):
+                st.success("Aucune incohérence détectée dans les signaux examinés.")
+            elif not bad_rows.empty:
+                st.warning(f"{len(bad_rows)} signal(aux) nécessitent une vérification. L’historique n’a pas été modifié.")
+            st.download_button("Exporter l’audit de l’historique CSV", saved_signal_audit.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_audit_historique_signaux.csv", mime="text/csv", key="download_saved_signal_consistency_audit")
+    with test_col:
+        if st.button("Tester les contrôles avant enregistrement", key="run_signal_record_consistency_tests"):
+            signal_record_tests = run_signal_record_consistency_tests()
+            st.dataframe(signal_record_tests, use_container_width=True, hide_index=True)
+            signal_test_failures = signal_record_tests[signal_record_tests["État"] == "ÉCHEC"]
+            if signal_test_failures.empty:
+                st.success(f"{len(signal_record_tests)} tests de cohérence réussis.")
+            else:
+                st.error(f"{len(signal_test_failures)} test(s) de cohérence en échec.")
+            st.download_button("Exporter les tests de cohérence CSV", signal_record_tests.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_tests_coherence_signaux.csv", mime="text/csv", key="download_signal_record_consistency_tests")
+
+    st.divider()
+    st.subheader("Dimensionnement du risque et arrondi du volume — Phase 50")
+    st.info("Le volume théorique est arrondi vers le bas au pas indiqué. Le calcul vérifie que le risque estimé après arrondi ne dépasse pas le budget fourni. Il ne se connecte pas au courtier et ne remplace pas les spécifications exactes du symbole dans MT5.")
+    if st.button("Tester le calcul de lots et l'arrondi", key="run_position_sizing_rounding_tests"):
+        position_sizing_tests = run_position_sizing_rounding_tests()
+        st.dataframe(position_sizing_tests, use_container_width=True, hide_index=True)
+        position_sizing_failures = position_sizing_tests[position_sizing_tests["État"] == "ÉCHEC"]
+        if position_sizing_failures.empty:
+            st.success(f"{len(position_sizing_tests)} tests de dimensionnement réussis.")
+        else:
+            st.error(f"{len(position_sizing_failures)} test(s) de dimensionnement en échec.")
+        st.download_button("Exporter les tests de dimensionnement CSV", position_sizing_tests.to_csv(index=False).encode("utf-8-sig"), file_name="forexscope_tests_dimensionnement_risque.csv", mime="text/csv", key="download_position_sizing_rounding_tests")
+
+    st.divider()
+    st.subheader("Tests du cycle de vie des signaux")
+    st.caption("Exécute les tests dans une base SQLite temporaire isolée : création, anti-doublon, mise à jour du résultat, journal d’exécution et refus d’un signal incohérent. L’historique réel n’est pas modifié.")
+    if st.button("Tester le cycle de vie des signaux", key="run_signal_lifecycle_tests"):
+        lifecycle_tests = run_signal_lifecycle_tests()
+        st.dataframe(lifecycle_tests, use_container_width=True, hide_index=True)
+        lifecycle_failures = lifecycle_tests[lifecycle_tests["État"] == "ÉCHEC"]
+        if lifecycle_failures.empty:
+            st.success(f"{len(lifecycle_tests)} tests du cycle de vie réussis.")
+        else:
+            st.error(f"{len(lifecycle_failures)} test(s) du cycle de vie en échec.")
+        st.download_button(
+            "Exporter les tests du cycle de vie CSV",
+            data=lifecycle_tests.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forexscope_tests_cycle_vie_signaux.csv",
+            mime="text/csv",
+            key="download_signal_lifecycle_tests",
+        )
+
+    st.divider()
+    st.subheader("Audit technique local")
+    st.caption("Contrôles de configuration, stockage et intégrité des bougies déjà chargées. Aucun nouvel appel au fournisseur de données n’est effectué.")
+    st.markdown("**Qualité des bougies du marché sélectionné**")
+    quality_report = build_candle_quality_report(candles, timeframe)
+    st.dataframe(quality_report, use_container_width=True, hide_index=True)
+    quality_problems = quality_report[quality_report["État"].isin(["ERREUR", "À VÉRIFIER", "INDISPONIBLE"])]
+    if quality_problems.empty:
+        st.success("Les contrôles de qualité des bougies chargées sont satisfaisants.")
+    else:
+        st.warning(f"{len(quality_problems)} contrôle(s) de qualité demandent une vérification.")
+    st.download_button(
+        "Exporter le contrôle qualité des bougies CSV",
+        data=quality_report.to_csv(index=False).encode("utf-8-sig"),
+        file_name="forexscope_qualite_bougies.csv", mime="text/csv", key="download_candle_quality_report",
+    )
+    if st.button("Tester la validation OHLC", key="run_market_data_integrity_tests"):
+        data_tests = run_market_data_integrity_tests()
+        st.dataframe(data_tests, use_container_width=True, hide_index=True)
+        failures = data_tests[data_tests["État"] == "ÉCHEC"]
+        if failures.empty:
+            st.success(f"{len(data_tests)} tests de validation OHLC réussis.")
+        else:
+            st.error(f"{len(failures)} test(s) OHLC en échec.")
+        st.download_button(
+            "Exporter les tests OHLC CSV", data=data_tests.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forexscope_tests_validation_ohlc.csv", mime="text/csv", key="download_market_data_integrity_tests",
+        )
+    
+    if st.button("Exécuter l’audit technique", key="run_local_technical_audit"):
+        audit_report = audit_runtime_configuration(candles)
+        st.dataframe(audit_report, use_container_width=True, hide_index=True)
+        problems = audit_report[audit_report["État"].isin(["ERREUR", "À VÉRIFIER", "INDISPONIBLES"])]
+        if problems.empty:
+            st.success("Aucun problème détecté par ces contrôles locaux.")
+        else:
+            st.warning(f"{len(problems)} contrôle(s) nécessitent une vérification. Consulte le détail ci-dessus.")
+        st.download_button(
+            "Exporter le rapport d’audit CSV",
+            data=audit_report.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forexscope_audit_technique.csv",
+            mime="text/csv",
+            key="download_local_technical_audit",
+        )
+
+
+
+    st.divider()
+    st.subheader("Checklist de pré-finalisation — Phase 54")
+    st.caption("Cette checklist sert à suivre les validations manuelles avant de considérer ForexScope comme prêt. Cocher un élément signifie que tu l’as réellement vérifié sur l’application déployée, pas seulement que le code existe.")
+    checklist_items = [
+        ("render_start", "L’application démarre sur Render sans erreur."),
+        ("data_live", "Les bougies se chargent pour plusieurs symboles et unités de temps."),
+        ("time_integrity", "Les tests d’intégrité temporelle passent."),
+        ("mtf_integrity", "Les tests de cohérence et d’intégrité MTF passent."),
+        ("risk_checks", "Les tests de cohérence SL/TP et de dimensionnement du risque passent."),
+        ("signal_lifecycle", "Les tests du cycle de vie des signaux passent."),
+        ("storage_backup", "Une sauvegarde SQLite est téléchargée et son intégrité vérifiée."),
+        ("restart_persistence", "Après redémarrage/redéploiement, l’historique est toujours présent."),
+        ("walk_forward", "Les tests chronologiques sont exécutés et leurs limites examinées."),
+        ("paper_test", "Le moteur est testé en démo/paper trading sans argent réel."),
+    ]
+    completed_items = []
+    checklist_cols = st.columns(2)
+    for idx, (item_key, item_label) in enumerate(checklist_items):
+        with checklist_cols[idx % 2]:
+            checked = st.checkbox(item_label, key=f"phase54_check_{item_key}")
+        completed_items.append({"Contrôle": item_label, "État": "VALIDÉ MANUELLEMENT" if checked else "À FAIRE"})
+    done_count = sum(row["État"] == "VALIDÉ MANUELLEMENT" for row in completed_items)
+    st.progress(done_count / len(completed_items))
+    st.write(f"**Avancement déclaré : {done_count}/{len(completed_items)} contrôles.**")
+    checklist_df = pd.DataFrame(completed_items)
+    if done_count == len(completed_items):
+        st.success("Tous les contrôles de la checklist sont cochés. Cela ne prouve pas la rentabilité : les résultats historiques et le paper trading doivent encore être interprétés avec prudence.")
+    else:
+        st.info("La finalisation reste conditionnelle aux contrôles non cochés, notamment au redémarrage Render, à la persistance des données et au paper trading.")
+    st.download_button(
+        "Exporter la checklist de pré-finalisation CSV",
+        data=checklist_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="forexscope_checklist_pre_finalisation.csv",
+        mime="text/csv",
+        key="download_phase54_finalization_checklist",
+    )
+
+
+    st.divider()
+    st.subheader("Batterie consolidée de tests — Phase 55")
+    st.caption("Lance une série de tests déterministes locaux. Ces tests n’envoient aucun ordre et ne remplacent pas les vérifications manuelles sur Render ni le paper trading.")
+    if st.button("Exécuter tous les tests locaux", key="phase55_run_all_tests"):
+        consolidated_tests = [
+            ("Validation OHLC", run_market_data_integrity_tests),
+            ("Intégrité des horodatages MTF", run_mtf_integrity_unit_tests),
+            ("Disponibilité de la confluence MTF", run_mtf_readiness_tests),
+            ("Fraîcheur des données de signal", run_signal_freshness_guard_tests),
+            ("Arrondi et dimensionnement des lots", run_position_sizing_rounding_tests),
+            ("Cohérence des niveaux du signal", run_signal_record_consistency_tests),
+            ("Cycle de vie et doublons", run_signal_lifecycle_tests),
+            ("Sauvegarde et restauration SQLite", run_storage_integrity_tests),
+            ("Regroupement mensuel des performances", test_period_robustness_report),
+            ("Moteur SMC", run_smc_engine_self_tests),
+            ("Intégrité temporelle SMC", run_smc_temporal_integrity_tests),
+        ]
+        consolidated_rows = []
+        details_rows = []
+        for test_label, test_function in consolidated_tests:
+            try:
+                test_result = test_function()
+                if isinstance(test_result, pd.DataFrame):
+                    result_frame = test_result.copy()
+                    if "État" in result_frame.columns:
+                        state_values = result_frame["État"].astype(str).str.upper().str.strip()
+                        failed_mask = state_values.isin(["ÉCHEC", "ECHEC", "FAIL", "FAILED"])
+                    elif "Statut" in result_frame.columns:
+                        state_values = result_frame["Statut"].astype(str).str.upper().str.strip()
+                        failed_mask = state_values.isin(["ÉCHEC", "ECHEC", "FAIL", "FAILED"])
+                    else:
+                        failed_mask = pd.Series(False, index=result_frame.index)
+                    failed_count = int(failed_mask.sum())
+                    test_state = "ÉCHEC" if failed_count else "RÉUSSI"
+                    test_count = len(result_frame)
+                    details_rows.append({"Batterie": test_label, "Détail": result_frame.to_json(orient="records", force_ascii=False, date_format="iso")})
+                else:
+                    failed_count = 0
+                    test_count = 1
+                    test_state = "RÉUSSI"
+                    details_rows.append({"Batterie": test_label, "Détail": str(test_result)[:2000]})
+                consolidated_rows.append({"Contrôle": test_label, "État": test_state, "Tests retournés": test_count, "Échecs détectés": failed_count})
+            except Exception as exc:
+                consolidated_rows.append({"Contrôle": test_label, "État": "ERREUR", "Tests retournés": 0, "Échecs détectés": 1})
+                details_rows.append({"Batterie": test_label, "Détail": f"{type(exc).__name__}: {exc}"})
+        consolidated_df = pd.DataFrame(consolidated_rows)
+        details_df = pd.DataFrame(details_rows)
+        st.dataframe(consolidated_df, use_container_width=True, hide_index=True)
+        total_failed = int(consolidated_df["Échecs détectés"].sum())
+        total_errors = int((consolidated_df["État"] == "ERREUR").sum())
+        if total_failed == 0 and total_errors == 0:
+            st.success(f"Les {len(consolidated_df)} batteries locales ont terminé sans échec détecté.")
+        else:
+            st.error(f"Des problèmes ont été détectés : {total_failed} échec(s) ou {total_errors} erreur(s) d’exécution. Consulte le rapport détaillé.")
+        with st.expander("Détails des batteries de tests"):
+            st.dataframe(details_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Exporter le bilan consolidé CSV",
+            data=consolidated_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forexscope_bilan_tests_phase55.csv",
+            mime="text/csv",
+            key="phase55_download_consolidated_tests",
+        )
+        st.download_button(
+            "Exporter les détails des tests CSV",
+            data=details_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forexscope_details_tests_phase55.csv",
+            mime="text/csv",
+            key="phase55_download_test_details",
+        )
+    st.info("Un résultat local réussi ne confirme pas la disponibilité du fournisseur de données, la persistance du disque Render après redéploiement, ni la rentabilité. Ces points doivent être vérifiés séparément.")
+
+st.divider()
+st.caption(
+    "ForexScope • Page actualisée à : "
+    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+)
             
 
 
