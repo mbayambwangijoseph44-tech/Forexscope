@@ -51,10 +51,17 @@ class DerivClient:
         self.url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id}"
 
     async def _request(self, payload: dict, timeout: float = 15.0) -> dict:
+        # En-têtes imitant un vrai navigateur : Cloudflare (qui protège les
+        # serveurs Deriv) bloque plus facilement les requêtes qui ressemblent
+        # à un script/bot, surtout depuis une IP d'hébergeur cloud.
         async with websockets.connect(
             self.url,
             open_timeout=timeout,
-            user_agent_header="Forexscope/1.0",
+            user_agent_header=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            origin="https://app.deriv.com",
         ) as ws:
             await ws.send(json.dumps(payload))
             while True:
@@ -125,4 +132,3 @@ class DerivClient:
             return age_secondes < 300
         except Exception:
             return False
-                  
