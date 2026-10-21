@@ -15,14 +15,22 @@ import traceback
 import streamlit as st
 
 from deriv_client import DerivClient, PAIRES_MAJEURES, GRANULARITES
+from browser_bridge import get_last_tick_browser, get_candles_browser
 
 st.set_page_config(page_title="Forexscope — Diagnostic Deriv", page_icon="🔌", layout="centered")
 
 st.title("🔌 Forexscope — Diagnostic de connexion Deriv")
 st.caption(
     "Cette page ne fait qu'une chose : vérifier que la connexion à l'API Deriv "
-    "fonctionne de façon fiable depuis Streamlit. Aucune analyse, aucun signal, "
-    "aucune persistance pour l'instant — volontairement."
+    "fonctionne de façon fiable. Aucune analyse, aucun signal, aucune persistance "
+    "pour l'instant — volontairement."
+)
+
+st.error(
+    "⚠️ La méthode SERVEUR (ci-dessous, section 1) échoue actuellement avec "
+    "HTTP 520 — confirmé sur Streamlit Cloud ET Render. Utilisez la section "
+    "MÉTHODE NAVIGATEUR plus bas, qui contourne ce blocage.",
+    icon="⚠️",
 )
 
 client = DerivClient()
@@ -81,7 +89,46 @@ if st.button("3️⃣ Vérifier l'état du marché (ouvert / fermé)", use_conta
             st.code(f"{e}\n\n{traceback.format_exc()}", language="text")
 
 st.divider()
+st.subheader("🌐 Méthode NAVIGATEUR (contourne le blocage Cloudflare)")
 st.caption(
-    "Prochaine étape UNE FOIS que ces trois tests passent de façon répétée et fiable : "
-    "ajouter l'analyse de structure et le moteur de décision (Partie 2)."
+    "Ici, la connexion WebSocket est ouverte depuis le navigateur de "
+    "l'utilisateur (votre téléphone/ordinateur), pas depuis le serveur. "
+    "L'IP qui contacte Deriv est donc résidentielle/mobile, pas une IP de "
+    "datacenter — ce que Cloudflare bloque beaucoup moins facilement."
+)
+
+col3, col4 = st.columns(2)
+
+with col3:
+    if st.button("1️⃣🌐 Tester le dernier prix (navigateur)", use_container_width=True):
+        with st.spinner("Connexion depuis votre navigateur vers Deriv..."):
+            try:
+                tick = get_last_tick_browser(symbole)
+                if tick:
+                    st.success("Connexion réussie depuis le navigateur !")
+                    st.json(tick)
+                elif tick == {}:
+                    st.info("En attente de la réponse du navigateur... clique à nouveau si rien ne s'affiche.")
+            except Exception as e:
+                st.error(f"Échec (navigateur) : {type(e).__name__}")
+                st.code(str(e), language="text")
+
+with col4:
+    if st.button("2️⃣🌐 Tester les bougies (navigateur)", use_container_width=True):
+        with st.spinner("Connexion depuis votre navigateur vers Deriv..."):
+            try:
+                candles = get_candles_browser(symbole, granularite, count=50)
+                if candles:
+                    st.success(f"{len(candles)} bougies récupérées depuis le navigateur !")
+                    st.dataframe(candles[-10:], use_container_width=True, hide_index=True)
+                else:
+                    st.info("En attente de la réponse du navigateur... clique à nouveau si rien ne s'affiche.")
+            except Exception as e:
+                st.error(f"Échec (navigateur) : {type(e).__name__}")
+                st.code(str(e), language="text")
+
+st.divider()
+st.caption(
+    "Prochaine étape UNE FOIS que la méthode navigateur passe de façon répétée et fiable : "
+    "brancher le moteur d'analyse (structure, régime, scores) sur ces données (Partie 2)."
 )
