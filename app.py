@@ -15,7 +15,12 @@ import traceback
 import streamlit as st
 
 from deriv_client import DerivClient, PAIRES_MAJEURES, GRANULARITES
-from browser_bridge import get_last_tick_browser, get_candles_browser
+from browser_bridge import (
+    demander_dernier_tick,
+    lire_dernier_tick,
+    demander_bougies,
+    lire_bougies,
+)
 
 st.set_page_config(page_title="Forexscope — Diagnostic Deriv", page_icon="🔌", layout="centered")
 
@@ -94,38 +99,50 @@ st.caption(
     "Ici, la connexion WebSocket est ouverte depuis le navigateur de "
     "l'utilisateur (votre téléphone/ordinateur), pas depuis le serveur. "
     "L'IP qui contacte Deriv est donc résidentielle/mobile, pas une IP de "
-    "datacenter — ce que Cloudflare bloque beaucoup moins facilement."
+    "datacenter — ce que Cloudflare bloque beaucoup moins facilement.\n\n"
+    "**Fonctionnement** : au clic, un script invisible se connecte à Deriv "
+    "depuis votre navigateur, puis la page se recharge automatiquement une "
+    "fois la donnée reçue — c'est normal, pas une erreur."
 )
+
+# --- Affichage des résultats déjà reçus (après le rechargement déclenché par le JS) ---
+if "fs_tick" in st.query_params:
+    try:
+        tick = lire_dernier_tick()
+        if tick:
+            st.success("✅ Connexion réussie depuis le navigateur (dernier prix) !")
+            st.json(tick)
+        else:
+            st.warning("Connexion établie, mais aucune donnée renvoyée.")
+    except Exception as e:
+        st.error(f"Échec (navigateur) : {e}")
+    if st.button("Effacer ce résultat"):
+        st.query_params.clear()
+        st.rerun()
+
+if "fs_candles" in st.query_params:
+    try:
+        candles = lire_bougies()
+        if candles:
+            st.success(f"✅ {len(candles)} bougies récupérées depuis le navigateur !")
+            st.dataframe(candles[-10:], use_container_width=True, hide_index=True)
+        else:
+            st.warning("Connexion établie, mais aucune bougie renvoyée.")
+    except Exception as e:
+        st.error(f"Échec (navigateur) : {e}")
+    if st.button("Effacer ce résultat ", key="clear_candles"):
+        st.query_params.clear()
+        st.rerun()
 
 col3, col4 = st.columns(2)
 
 with col3:
     if st.button("1️⃣🌐 Tester le dernier prix (navigateur)", use_container_width=True):
-        with st.spinner("Connexion depuis votre navigateur vers Deriv..."):
-            try:
-                tick = get_last_tick_browser(symbole)
-                if tick:
-                    st.success("Connexion réussie depuis le navigateur !")
-                    st.json(tick)
-                elif tick == {}:
-                    st.info("En attente de la réponse du navigateur... clique à nouveau si rien ne s'affiche.")
-            except Exception as e:
-                st.error(f"Échec (navigateur) : {type(e).__name__}")
-                st.code(str(e), language="text")
+        demander_dernier_tick(symbole)
 
 with col4:
     if st.button("2️⃣🌐 Tester les bougies (navigateur)", use_container_width=True):
-        with st.spinner("Connexion depuis votre navigateur vers Deriv..."):
-            try:
-                candles = get_candles_browser(symbole, granularite, count=50)
-                if candles:
-                    st.success(f"{len(candles)} bougies récupérées depuis le navigateur !")
-                    st.dataframe(candles[-10:], use_container_width=True, hide_index=True)
-                else:
-                    st.info("En attente de la réponse du navigateur... clique à nouveau si rien ne s'affiche.")
-            except Exception as e:
-                st.error(f"Échec (navigateur) : {type(e).__name__}")
-                st.code(str(e), language="text")
+        demander_bougies(symbole, granularite, count=50)
 
 st.divider()
 st.caption(
